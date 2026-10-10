@@ -20,7 +20,7 @@ func TestUsage(t *testing.T) {
 		{[]string{"version"}, exitOK, "minibox dev"},
 	} {
 		var stdout, stderr bytes.Buffer
-		code := run(tc.args, &stdout, &stderr)
+		code := run(tc.args, nil, &stdout, &stderr)
 		if code != tc.code {
 			t.Errorf("run(%q) = %d, want %d", tc.args, code, tc.code)
 		}
@@ -44,7 +44,7 @@ func TestCheckExitCode(t *testing.T) {
 	} {
 		checkHost = func() host.Report { return tc.report }
 		var stdout, stderr bytes.Buffer
-		if code := run([]string{"check"}, &stdout, &stderr); code != tc.code {
+		if code := run([]string{"check"}, nil, &stdout, &stderr); code != tc.code {
 			t.Errorf("check with %v exited %d, want %d", tc.report, code, tc.code)
 		}
 		if !strings.Contains(stdout.String(), tc.report[len(tc.report)-1].Detail) {

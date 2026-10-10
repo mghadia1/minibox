@@ -30,5 +30,18 @@ check "on the Mac, check fails and says Linux is needed" sh -c "cd '$here' && go
 check "an unknown command is a usage error (2)" sh -c "limactl shell '$vm' '$bin' bogus; test \$? -eq 2"
 check "version" sh -c "limactl shell '$vm' '$bin' version | grep -q '^minibox '"
 
+# Containers (Milestone 1), on the pinned root filesystem unpacked in the VM.
+rootfs=$("$here/scripts/rootfs.sh" aarch64) || exit 1
+in_vm sudo sh -c "rm -rf /var/tmp/minibox-smoke && mkdir -p /var/tmp/minibox-smoke && tar -xzf /mnt/minibox-dev/rootfs/$(basename "$rootfs") -C /var/tmp/minibox-smoke"
+run="sudo $bin run --rootfs /var/tmp/minibox-smoke"
+check "a container runs, with its own hostname" sh -c "test \"\$(limactl shell '$vm' $run --hostname smoke -- hostname)\" = smoke"
+check "its init is PID 1 and sees no host process" sh -c "limactl shell '$vm' $run -- ps -o pid,args | awk 'NR>1' | grep -qv -e minibox-init -e 'ps -o' && exit 1; limactl shell '$vm' $run -- ps -o pid,args | grep -q '^ *1 minibox-init'"
+check "the command's exit code comes back" sh -c "limactl shell '$vm' $run -- sh -c 'exit 7'; test \$? -eq 7"
+check "a missing command is 127" sh -c "limactl shell '$vm' $run -- no-such-command 2>/dev/null; test \$? -eq 127"
+check "run without root is 125" sh -c "limactl shell '$vm' '$bin' run --rootfs /var/tmp/minibox-smoke -- true 2>/dev/null; test \$? -eq 125"
+check "nothing is left running" sh -c "! limactl shell '$vm' pgrep -f minibox-init"
+check "no mount is left on the host" sh -c "! limactl shell '$vm' grep -q minibox-smoke /proc/self/mountinfo"
+in_vm sudo rm -rf /var/tmp/minibox-smoke
+
 echo "$passed passed, $failed failed"
 [ "$failed" -eq 0 ]

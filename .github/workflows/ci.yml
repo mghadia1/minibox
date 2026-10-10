@@ -36,7 +36,7 @@ jobs:
       # As root: namespaces, mounts and cgroups need it. MINIBOX_TEST_REQUIRE
       # turns tests that would skip without them into failures.
       - name: go test -race
-        run: sudo env "PATH=$PATH" MINIBOX_TEST_REQUIRE=1 MINIBOX_TEST_ROOTFS="${{ steps.rootfs.outputs.path }}" go test -race -count=1 ./...
+        run: sudo env "PATH=$PATH" MINIBOX_TEST_REQUIRE=1 MINIBOX_TEST_ROOTFS="${{ steps.rootfs.outputs.path }}" go test -race -count=1 -timeout 5m ./...
 
       - name: minibox check
         run: |
