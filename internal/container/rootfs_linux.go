@@ -7,16 +7,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
 
-// setupRootfs makes rootfs the container's / and gives it /proc, /dev and
-// /sys. It runs in Init, in the container's new mount namespace.
-func setupRootfs(rootfs string) error {
+// setupRootfs makes the container's root filesystem its / and gives it
+// /proc, /dev and /sys. It runs in Init, in the container's new mount
+// namespace: every mount made here goes when the namespace does.
+func setupRootfs(cfg Config) error {
+	rootfs := cfg.Rootfs
 	// Mount events must not travel back to the host. systemd makes / a
 	// shared mount, and a new mount namespace starts as a copy of it, so
-	// without this the bind mount below would also appear on the host.
+	// without this the mounts below would also appear on the host.
 	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("making mounts private: %w", err)
 	}
@@ -27,8 +30,15 @@ func setupRootfs(rootfs string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("%s is not a directory", rootfs)
 	}
-	// pivot_root needs the new root to be a mount point.
-	if err := unix.Mount(rootfs, rootfs, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+	if len(cfg.Lower) > 0 {
+		// The image's layers, read-only, under the container's own: the
+		// overlay is mounted inside this namespace, so it cannot outlive
+		// the container even if `minibox run` is killed.
+		if err := mountOverlay(cfg); err != nil {
+			return err
+		}
+	} else if err := unix.Mount(rootfs, rootfs, "", unix.MS_BIND|unix.MS_REC, ""); err != nil {
+		// pivot_root needs the new root to be a mount point.
 		return fmt.Errorf("bind-mounting %s: %w", rootfs, err)
 	}
 	if err := pivotRoot(rootfs); err != nil {
@@ -37,6 +47,20 @@ func setupRootfs(rootfs string) error {
 	// From here every path is the container's: a symbolic link in its root
 	// filesystem can only point at something else in it.
 	return mountSpecial()
+}
+
+// maxMountData is the most a mount's options may hold: one page.
+const maxMountData = 4096
+
+func mountOverlay(cfg Config) error {
+	data := "lowerdir=" + strings.Join(cfg.Lower, ":") + ",upperdir=" + cfg.Upper + ",workdir=" + cfg.Work
+	if len(data) >= maxMountData {
+		return fmt.Errorf("%d layers: their paths make overlay options of %d bytes, over the kernel's %d", len(cfg.Lower), len(data), maxMountData)
+	}
+	if err := unix.Mount("overlay", cfg.Rootfs, "overlay", 0, data); err != nil {
+		return fmt.Errorf("mounting the image's layers: %w", err)
+	}
+	return nil
 }
 
 // pivotRoot swaps the root and detaches the old one, so that no path

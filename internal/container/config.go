@@ -27,6 +27,18 @@ type Config struct {
 	Args     []string `json:"args"`     // the command and its arguments
 	Env      []string `json:"env"`      // KEY=value, the command's whole environment
 	Cwd      string   `json:"cwd"`      // absolute, inside the container
+
+	// An image's layers, when set: Init mounts them as an overlay on
+	// Rootfs (an empty folder) before anything else. Lower is top layer
+	// first, read-only; Upper takes the container's writes.
+	Lower []string `json:"lower,omitempty"`
+	Upper string   `json:"upper,omitempty"`
+	Work  string   `json:"work,omitempty"`
+
+	// User runs the command as "name", "uid", "name:group" or "uid:gid",
+	// looked up in the container's own /etc/passwd and /etc/group. Empty
+	// is root.
+	User string `json:"user,omitempty"`
 }
 
 // Exit codes for a container that could not be run, as Docker gives them:
@@ -39,7 +51,6 @@ const (
 	ExitNotFound      = 127
 	exitSignalBase    = 128
 	defaultPath       = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-	defaultHome       = "/root"
 	hostnameMaxLength = 64 // HOST_NAME_MAX
 )
 
@@ -52,14 +63,24 @@ func NewID() string {
 	return hex.EncodeToString(b)
 }
 
-// Environment builds the command's environment: PATH, HOME and HOSTNAME,
-// TERM if the caller has one, then the variables asked for (KEY=value),
-// which replace the defaults of the same name. The host's own environment
-// is never passed in.
-func Environment(hostname, term string, extra []string) ([]string, error) {
-	env := []string{"PATH=" + defaultPath, "HOME=" + defaultHome, "HOSTNAME=" + hostname}
+// Environment builds the command's environment: a default PATH unless
+// the image has one, the image's variables, HOSTNAME, TERM if the caller
+// has one, then the variables asked for (KEY=value), each replacing one
+// of the same name. HOME is added by Init, from the user's passwd entry.
+// The host's own environment is never passed in.
+func Environment(hostname, term string, image, extra []string) ([]string, error) {
+	var env []string
+	if _, ok := lookupEnv(image, "PATH"); !ok {
+		env = append(env, "PATH="+defaultPath)
+	}
+	for _, kv := range image {
+		if name, _, ok := strings.Cut(kv, "="); ok && name != "" {
+			env = setEnv(env, kv)
+		}
+	}
+	env = setEnv(env, "HOSTNAME="+hostname)
 	if term != "" {
-		env = append(env, "TERM="+term)
+		env = setEnv(env, "TERM="+term)
 	}
 	for _, kv := range extra {
 		name, _, ok := strings.Cut(kv, "=")
@@ -96,6 +117,14 @@ func (c Config) Validate() error {
 		return fmt.Errorf("working directory %q is not an absolute path", c.Cwd)
 	case c.Hostname == "" || len(c.Hostname) > hostnameMaxLength:
 		return fmt.Errorf("hostname %q must be 1 to %d characters", c.Hostname, hostnameMaxLength)
+	}
+	if len(c.Lower) > 0 {
+		// overlayfs reads its options as "lowerdir=a:b,upperdir=...".
+		for _, p := range append([]string{c.Upper, c.Work}, c.Lower...) {
+			if !path.IsAbs(p) || strings.ContainsAny(p, ":,") {
+				return fmt.Errorf("overlay folder %q must be an absolute path without ':' or ','", p)
+			}
+		}
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ package container
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -31,7 +32,7 @@ type result struct {
 }
 
 func config(rootfs string, args ...string) Config {
-	env, err := Environment("box", "", nil)
+	env, err := Environment("box", "", nil, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -429,7 +430,9 @@ func must(t *testing.T, err error) {
 	}
 }
 
-// After every test above, nothing of theirs is still running.
+// After every test above, nothing of theirs is still running: no Init
+// whose parent is this test process. (Only its own: other packages' tests
+// run at the same time, with containers of their own.)
 func TestNoContainerLeftRunning(t *testing.T) {
 	testutil.RequireRoot(t)
 	rootfs := testutil.Rootfs(t)
@@ -438,10 +441,20 @@ func TestNoContainerLeftRunning(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	me := fmt.Sprint(os.Getpid())
 	for _, e := range entries {
 		cmdline, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err == nil && bytes.HasPrefix(cmdline, []byte("minibox-init\x00")) {
-			t.Errorf("an init is still running: pid %s", e.Name())
+		if err != nil || !bytes.HasPrefix(cmdline, []byte("minibox-init\x00")) {
+			continue
+		}
+		stat, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		// The fields after the command name: state, then the parent's pid.
+		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
+		if len(fields) > 1 && fields[1] == me {
+			t.Errorf("an init of this test is still running: pid %s", e.Name())
 		}
 	}
 }

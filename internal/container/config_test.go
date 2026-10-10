@@ -10,21 +10,31 @@ import (
 )
 
 func TestEnvironment(t *testing.T) {
-	env, err := Environment("box", "xterm", []string{"A=1", "PATH=/bin", "EMPTY="})
+	env, err := Environment("box", "xterm", nil, []string{"A=1", "PATH=/bin", "EMPTY="})
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"PATH=/bin", "HOME=/root", "HOSTNAME=box", "TERM=xterm", "A=1", "EMPTY="}
+	want := []string{"PATH=/bin", "HOSTNAME=box", "TERM=xterm", "A=1", "EMPTY="}
 	if !slices.Equal(env, want) {
 		t.Fatalf("Environment = %q, want %q", env, want)
 	}
-	if env, _ := Environment("box", "", nil); slices.ContainsFunc(env, func(s string) bool { return strings.HasPrefix(s, "TERM=") }) {
+	if env, _ := Environment("box", "", nil, nil); slices.ContainsFunc(env, func(s string) bool { return strings.HasPrefix(s, "TERM=") }) {
 		t.Fatalf("no TERM given, but got %q", env)
 	}
 	for _, bad := range []string{"NOVALUE", "=x", "A\x00B=1"} {
-		if _, err := Environment("box", "", []string{bad}); err == nil {
+		if _, err := Environment("box", "", nil, []string{bad}); err == nil {
 			t.Errorf("Environment accepted %q", bad)
 		}
+	}
+	// An image's own PATH replaces the default; its variables come before
+	// HOSTNAME and the caller's, which replace them.
+	env, err = Environment("box", "", []string{"PATH=/opt/bin", "LANG=C.UTF-8", "HOSTNAME=image", "A=image"}, []string{"A=caller"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = []string{"PATH=/opt/bin", "LANG=C.UTF-8", "HOSTNAME=box", "A=caller"}
+	if !slices.Equal(env, want) {
+		t.Fatalf("with an image: %q, want %q", env, want)
 	}
 }
 
@@ -42,6 +52,9 @@ func TestValidate(t *testing.T) {
 		"relative cwd":      func(c *Config) { c.Cwd = "tmp" },
 		"no hostname":       func(c *Config) { c.Hostname = "" },
 		"long hostname":     func(c *Config) { c.Hostname = strings.Repeat("h", 65) },
+		"relative layer":    func(c *Config) { c.Lower, c.Upper, c.Work = []string{"l"}, "/u", "/w" },
+		"colon in a layer":  func(c *Config) { c.Lower, c.Upper, c.Work = []string{"/l:x"}, "/u", "/w" },
+		"comma in upper":    func(c *Config) { c.Lower, c.Upper, c.Work = []string{"/l"}, "/u,x", "/w" },
 	} {
 		c := good
 		change(&c)

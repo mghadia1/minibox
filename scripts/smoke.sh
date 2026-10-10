@@ -43,5 +43,18 @@ check "nothing is left running" sh -c "! limactl shell '$vm' pgrep -f minibox-in
 check "no mount is left on the host" sh -c "! limactl shell '$vm' grep -q minibox-smoke /proc/self/mountinfo"
 in_vm sudo rm -rf /var/tmp/minibox-smoke
 
+# Images (Milestone 2): a real pull from Docker Hub, into a store of its own.
+store="sudo env MINIBOX_ROOT=/var/tmp/minibox-smoke-store $bin"
+in_vm sudo rm -rf /var/tmp/minibox-smoke-store
+check "pull alpine:3.22 from Docker Hub" in_vm $store pull alpine:3.22
+check "images lists it" sh -c "limactl shell '$vm' $store images | grep -q '^alpine:3.22 '"
+check "run it: Alpine 3.22 inside" sh -c "limactl shell '$vm' $store run alpine:3.22 cat /etc/alpine-release | grep -q '^3\.22\.'"
+check "a write stays in its container" sh -c "limactl shell '$vm' $store run alpine:3.22 sh -c 'echo x > /etc/written'; limactl shell '$vm' $store run alpine:3.22 test ! -e /etc/written"
+check "no container folder is left" sh -c "test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/containers)\""
+check "no overlay is left mounted" sh -c "! limactl shell '$vm' grep -q minibox-smoke-store /proc/self/mountinfo"
+check "rmi removes the image and its layers" sh -c "limactl shell '$vm' $store rmi alpine:3.22 && test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/layers)\""
+check "an image that is not here is 125" sh -c "limactl shell '$vm' $store run alpine:3.22 true 2>/dev/null; test \$? -eq 125"
+in_vm sudo rm -rf /var/tmp/minibox-smoke-store
+
 echo "$passed passed, $failed failed"
 [ "$failed" -eq 0 ]

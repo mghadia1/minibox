@@ -3,9 +3,11 @@
 package container
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -41,11 +43,24 @@ func Init() {
 		fail(ExitSetup, err)
 	}
 
-	if err := setupRootfs(cfg.Rootfs); err != nil {
+	if err := setupRootfs(cfg); err != nil {
 		fail(ExitSetup, fmt.Errorf("root filesystem: %w", err))
 	}
 	if err := unix.Sethostname([]byte(cfg.Hostname)); err != nil {
 		fail(ExitSetup, fmt.Errorf("hostname: %w", err))
+	}
+	// From here on, every file is the container's own.
+	creds, err := user(cfg.User)
+	if err != nil {
+		fail(ExitSetup, err)
+	}
+	env := cfg.Env
+	if _, ok := lookupEnv(env, "HOME"); !ok {
+		env = append(env, "HOME="+creds.Home)
+	}
+	// An image's working directory may not exist yet: Docker makes it.
+	if err := os.MkdirAll(cfg.Cwd, 0o755); err != nil {
+		fail(ExitSetup, fmt.Errorf("working directory: %w", err))
 	}
 
 	// Ask for signals before the command exists, so that no exit and no
@@ -53,16 +68,16 @@ func Init() {
 	sigs := make(chan os.Signal, 64)
 	signal.Notify(sigs, append([]os.Signal{syscall.SIGCHLD}, Forwarded...)...)
 
-	pathEnv, _ := lookupEnv(cfg.Env, "PATH")
+	pathEnv, _ := lookupEnv(env, "PATH")
 	file, err := lookPath(cfg.Args[0], pathEnv)
 	if err != nil {
 		fail(invokeCode(err), fmt.Errorf("%s: %w", cfg.Args[0], err))
 	}
-	child, err := syscall.ForkExec(file, cfg.Args, &syscall.ProcAttr{
-		Dir:   cfg.Cwd,
-		Env:   cfg.Env,
-		Files: []uintptr{0, 1, 2},
-	})
+	attr := &syscall.ProcAttr{Dir: cfg.Cwd, Env: env, Files: []uintptr{0, 1, 2}}
+	if cfg.User != "" {
+		attr.Sys = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: creds.UID, Gid: creds.GID, Groups: creds.Groups}}
+	}
+	child, err := syscall.ForkExec(file, cfg.Args, attr)
 	if err != nil {
 		fail(invokeCode(err), fmt.Errorf("%s: %w", cfg.Args[0], err))
 	}
@@ -71,6 +86,34 @@ func Init() {
 	statusW = nil
 
 	os.Exit(supervise(child, sigs))
+}
+
+// user finds who the command runs as in the container's /etc/passwd and
+// /etc/group (either may be missing: a scratch image has neither). With
+// no user given it is root, and only HOME is looked up.
+func user(spec string) (Credentials, error) {
+	open := func(name string) io.Reader {
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return nil
+		}
+		return bytes.NewReader(data)
+	}
+	lookup := spec
+	if lookup == "" {
+		lookup = "0"
+	}
+	creds, err := ResolveUser(lookup, open("/etc/passwd"), open("/etc/group"))
+	if err != nil {
+		return Credentials{}, fmt.Errorf("user: %w", err)
+	}
+	if creds.Home == "" {
+		creds.Home = "/"
+		if creds.UID == 0 {
+			creds.Home = "/root"
+		}
+	}
+	return creds, nil
 }
 
 // invokeCode is the exit code for a command that could not be started:
