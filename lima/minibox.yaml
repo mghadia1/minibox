@@ -1,0 +1,56 @@
+# The Linux VM MiniBox is built for and tested in, on a Mac:
+#   limactl create --name=minibox lima/minibox.yaml && limactl start minibox
+# (or `make vm`). Ubuntu 24.04 as on GitHub Actions' runners.
+minimumLimaVersion: 2.0.0
+
+base:
+- template:_images/ubuntu-24.04
+
+vmType: vz
+cpus: 2
+memory: 2GiB
+disk: 10GiB
+
+# MiniBox is the container runtime here: no containerd, no nerdctl.
+containerd:
+  system: false
+  user: false
+
+# Only the development cache is shared, never the project folder itself:
+# `make vm-test` copies the source there first (this folder is iCloud-
+# synced, and reading a file iCloud has moved off the disk would stall).
+mounts:
+- location: "~/.cache/minibox-dev"
+  mountPoint: /mnt/minibox-dev
+  writable: true
+
+provision:
+- mode: system
+  script: |
+    #!/bin/sh
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+    # gcc for `go test -race` (cgo); nftables for networking (Milestone 4).
+    command -v gcc >/dev/null && command -v nft >/dev/null || {
+      apt-get update -q
+      apt-get install -y -q --no-install-recommends gcc libc6-dev make nftables
+    }
+    # Go, the version the Mac builds with, checked against go.dev's SHA-256.
+    if ! /usr/local/go/bin/go version 2>/dev/null | grep -q 'go1.27.1 '; then
+      case "$(uname -m)" in
+        aarch64) arch=arm64; sum=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec ;;
+        x86_64) arch=amd64; sum=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445 ;;
+      esac
+      curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go1.27.1.linux-$arch.tar.gz"
+      echo "$sum  /tmp/go.tgz" | sha256sum -c -
+      rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz && rm /tmp/go.tgz
+    fi
+    ln -sf /usr/local/go/bin/go /usr/local/bin/go
+    ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+probes:
+- script: |
+    #!/bin/sh
+    set -eu
+    timeout 600 sh -c 'until command -v go >/dev/null && command -v gcc >/dev/null; do sleep 3; done'
+  hint: the provisioning script installs Go and gcc

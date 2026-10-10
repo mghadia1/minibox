@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # Ubuntu 24.04, as in the Lima VM: cgroup v2, overlayfs, nftables.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: test root filesystem
+        id: rootfs
+        run: echo "path=$(./scripts/rootfs.sh x86_64)" >> "$GITHUB_OUTPUT"
+
+      # As root: namespaces, mounts and cgroups need it. MINIBOX_TEST_REQUIRE
+      # turns tests that would skip without them into failures.
+      - name: go test -race
+        run: sudo env "PATH=$PATH" MINIBOX_TEST_REQUIRE=1 MINIBOX_TEST_ROOTFS="${{ steps.rootfs.outputs.path }}" go test -race -count=1 ./...
+
+      - name: minibox check
+        run: |
+          go build -o bin/minibox ./cmd/minibox
+          sudo ./bin/minibox check
