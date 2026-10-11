@@ -13,6 +13,8 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/mghadia1/minibox/internal/network"
 )
 
 // Init is `minibox init`: PID 1 of a new container, started by Run. It
@@ -48,6 +50,11 @@ func Init() {
 	}
 	if err := unix.Sethostname([]byte(cfg.Hostname)); err != nil {
 		fail(ExitSetup, fmt.Errorf("hostname: %w", err))
+	}
+	if cfg.Network.Mode != network.Host {
+		if err := network.SetUpInside(cfg.Network); err != nil {
+			fail(ExitSetup, fmt.Errorf("network: %w", err))
+		}
 	}
 	// From here on, every file is the container's own.
 	creds, err := user(cfg.User)

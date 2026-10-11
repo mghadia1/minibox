@@ -15,11 +15,13 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/mghadia1/minibox/internal/cgroup"
+	"github.com/mghadia1/minibox/internal/network"
 )
 
 // Namespaces a container gets: its own hostname, process ids, mounts,
-// System V IPC and cgroup view (its own group is its "/"). It still shares
-// the host's network and users (Milestones 4 and 5).
+// System V IPC and cgroup view (its own group is its "/"), and its own
+// network unless it asks for the host's. It still shares the host's users
+// (Milestone 5).
 const cloneFlags = syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | unix.CLONE_NEWCGROUP
 
 // Forwarded are the signals passed on to the container's command: Run
@@ -75,9 +77,12 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 	if err := cfg.Validate(); err != nil {
 		return setup(err)
 	}
-	payload, err := json.Marshal(cfg)
-	if err != nil {
-		return setup(err)
+	if cfg.NetworkMode == "" {
+		cfg.NetworkMode = network.Bridge
+	}
+	flags := uintptr(cloneFlags)
+	if cfg.NetworkMode != network.Host {
+		flags |= syscall.CLONE_NEWNET
 	}
 	// A cgroup of its own, made first: Init is born inside it (clone3's
 	// CLONE_INTO_CGROUP), so nothing of the container runs outside its
@@ -124,7 +129,7 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdio.In, stdio.Out, stdio.Err
 	cmd.ExtraFiles = []*os.File{configR, statusW} // fds 3 and 4 in Init
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: cloneFlags,
+		Cloneflags: flags,
 		// A session of its own: a terminal's Ctrl-C reaches `minibox run`,
 		// which passes it on, rather than every process at once.
 		Setsid:      true,
@@ -138,6 +143,37 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 	configR.Close()
 	statusW.Close()
 
+	// Init exists, and waits for its configuration: its network namespace
+	// can be wired up now, from here.
+	switch cfg.NetworkMode {
+	case network.Bridge:
+		// Not "att, err :=": that would make a new err here, and the
+		// deferred function below would report into it, not into Run's.
+		att, aerr := network.Attach(cfg.ID, cmd.Process.Pid, cfg.Ports)
+		if aerr != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return setup(fmt.Errorf("network: %w", aerr))
+		}
+		defer func() {
+			// Reported like the group's removal: a lease or a published
+			// port left behind would block the next container.
+			if derr := att.Detach(); derr != nil && err == nil {
+				err = derr
+			}
+		}()
+		cfg.Network = att.InsideConfig(cfg.Hostname)
+	case network.None:
+		cfg.Network = network.NoneConfig(cfg.Hostname)
+	case network.Host:
+		cfg.Network = network.Inside{Mode: network.Host}
+	}
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return setup(err)
+	}
 	if _, err := configW.Write(payload); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()

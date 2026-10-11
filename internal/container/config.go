@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/mghadia1/minibox/internal/cgroup"
+	"github.com/mghadia1/minibox/internal/network"
 )
 
 // Config is everything Init needs, sent from Run as JSON.
@@ -45,6 +46,13 @@ type Config struct {
 	// Limits for the container's cgroup, applied by Run before Init
 	// starts (Init never sees them).
 	Limits cgroup.Limits `json:"-"`
+
+	// NetworkMode is bridge (the default), none or host; Ports are
+	// published on the bridge. Run attaches the container and fills in
+	// Network, which Init sets up inside.
+	NetworkMode network.Mode   `json:"-"`
+	Ports       []network.Port `json:"-"`
+	Network     network.Inside `json:"network"`
 }
 
 // Exit codes for a container that could not be run, as Docker gives them:
@@ -126,6 +134,9 @@ func (c Config) Validate() error {
 	}
 	if err := c.Limits.Validate(); err != nil {
 		return err
+	}
+	if c.NetworkMode != "" && c.NetworkMode != network.Bridge && len(c.Ports) > 0 {
+		return fmt.Errorf("ports can be published only on the bridge network, not %q", c.NetworkMode)
 	}
 	if len(c.Lower) > 0 {
 		// overlayfs reads its options as "lowerdir=a:b,upperdir=...".

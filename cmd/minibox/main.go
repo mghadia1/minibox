@@ -32,6 +32,7 @@ import (
 	"github.com/mghadia1/minibox/internal/container"
 	"github.com/mghadia1/minibox/internal/host"
 	"github.com/mghadia1/minibox/internal/image"
+	"github.com/mghadia1/minibox/internal/network"
 )
 
 // version is set at build time: -ldflags "-X main.version=...".
@@ -206,6 +207,9 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	fs.Var(&swap, "swap", "swap allowed on top of --memory (`size`)")
 	cpus := fs.Float64("cpus", 0, "CPU limit, in CPUs (0.5 is half of one)")
 	pids := fs.Int64("pids", 0, "most processes and threads at once")
+	netMode := fs.String("network", "bridge", "`mode`: bridge (its own address on MiniBox's bridge), none (loopback only) or host (the host's network)")
+	var ports listFlag
+	fs.Var(&ports, "p", "publish a port: `HOST:CONTAINER`[/tcp|/udp] (repeatable; bridge only)")
 	var entrypoint optionalString
 	fs.Var(&entrypoint, "entrypoint", "replace the image's entrypoint (`command`; \"\" for none)")
 	var env listFlag
@@ -232,6 +236,20 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if err := cfg.Limits.Validate(); err != nil {
 		fmt.Fprintln(stderr, "minibox:", err)
 		return container.ExitSetup
+	}
+	mode, err := network.ParseMode(*netMode)
+	if err != nil {
+		fmt.Fprintln(stderr, "minibox:", err)
+		return container.ExitSetup
+	}
+	cfg.NetworkMode = mode
+	for _, p := range ports {
+		port, err := network.ParsePort(p)
+		if err != nil {
+			fmt.Fprintln(stderr, "minibox:", err)
+			return container.ExitSetup
+		}
+		cfg.Ports = append(cfg.Ports, port)
 	}
 	var imageEnv []string
 	var cleanup func()

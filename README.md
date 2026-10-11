@@ -7,22 +7,24 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** Milestones 0-3 of 7 built, on my machine (no GitHub
-> repository yet, so CI has not run). `minibox pull alpine:3.22` fetches an
-> image from its registry, checking every digest, and unpacks its layers
-> safely; `minibox run alpine:3.22 sh` runs it on an overlay of those
-> layers, with its own hostname, process ids, mounts, IPC and cgroup, under
-> an init that reaps and passes signals on, within memory, CPU and process
-> limits (`--memory`, `--cpus`, `--pids`). **It is not a security boundary
+> **Status:** Milestones 0-4 of 7 built, on my machine (the GitHub
+> repository is empty, so CI has not run). `minibox pull alpine:3.22`
+> fetches an image from its registry, checking every digest, and unpacks
+> its layers safely; `minibox run alpine:3.22 sh` runs it on an overlay of
+> those layers, with its own hostname, process ids, mounts, IPC, cgroup and
+> network, under an init that reaps and passes signals on, within memory,
+> CPU and process limits (`--memory`, `--cpus`, `--pids`). Each container
+> has its own address on a bridge, reaches the internet through the host,
+> and can publish ports (`-p 8080:80`). **It is not a security boundary
 > yet:** the command is root with every capability (unless the image or
-> `-u` names a user), and shares the host's network and users, until
-> Milestones 4 and 5.
+> `-u` names a user) and shares the host's users, until Milestone 5.
 
 > **Where it runs:** Linux only, as root. On my Mac that is a Lima VM
 > (`lima/minibox.yaml`: Ubuntu 24.04, 2 CPUs, 2 GiB, 10 GiB disk); in CI,
-> GitHub's Ubuntu runners. From Milestone 4 MiniBox changes the network
-> setup of the machine it runs on (a bridge, nftables rules), so it belongs
-> in a disposable VM or CI runner, not on a machine anyone depends on.
+> GitHub's Ubuntu runners. MiniBox changes the network setup of the
+> machine it runs on (a bridge, nftables rules, IP forwarding turned on),
+> so it belongs in a disposable VM or CI runner, not on a machine anyone
+> depends on.
 
 ## Status
 
@@ -32,7 +34,7 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 | 1 | Isolation: namespaces, `pivot_root`, `/proc` and `/dev`, an init as PID 1 | Built |
 | 2 | Images: pulled from a registry and checked, safe layer extraction, overlayfs | Built |
 | 3 | Limits: cgroup v2 memory, CPU and pids; OOM kills reported | Built |
-| 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Not started |
+| 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Built |
 | 5 | Security: capabilities, `no_new_privs`, seccomp, masked paths, user namespaces | Not started |
 | 6 | The OCI runtime spec (a subset), compared with runc; start-up time measured | Not started |
 | 7 | README: diagram, decisions, failures, results; explain-it-yourself prompts | Not started |
@@ -59,9 +61,11 @@ sudo ./bin/minibox check
 
 `minibox check` says, one line each, whether the machine has what MiniBox
 needs: root, the namespaces (uts, pid, mnt, ipc, net, user, cgroup),
-cgroup v2 with the cpu, memory and pids controllers, overlayfs, and, for
-later milestones, user namespaces and nftables. Exit 0 when everything
-needed is there, 1 when something is missing, 2 for a usage error.
+cgroup v2 with the cpu, memory and pids controllers, overlayfs, and two
+warnings rather than failures: nftables (without it only `--network none`
+and `host` work) and user namespaces (for Milestone 5). Exit 0 when
+everything needed is there, 1 when something is missing, 2 for a usage
+error.
 
 ## Running a container
 
@@ -236,16 +240,110 @@ The quota holds to within 3% (a little over, never under). Under
 VM on one laptop: these say the limits work as written, not how they
 behave on a loaded server.
 
+## Networking
+
+```bash
+minibox run -p 8080:80 nginx:1.29-alpine             # http://127.0.0.1:8080, or the host's address
+minibox run alpine:3.22 wget -qO- http://10.99.0.2/  # another container, by its address
+minibox run --network none alpine:3.22 ip link       # loopback only
+minibox run --network host alpine:3.22 ip link       # the host's own network: no isolation
+```
+
+By default a container is on MiniBox's bridge, as on Docker's default
+bridge network:
+
+```
+host:       minibox0, a bridge, 10.99.0.1/24 ──── mbxID (host end) ─┐ a veth pair
+container:  eth0 10.99.0.N/24, default route via 10.99.0.1 ─────────┘ and lo, up
+nftables, table ip minibox (MiniBox's own):
+   prerouting, output   traffic to any of the host's addresses on a published port:
+                        DNAT (tcp, 8080) -> (10.99.0.N, 80), from a map
+   postrouting          masquerade: a container's traffic leaving the host; the host's own
+                        127.0.0.1 reaching a container; a container reaching a published
+                        port through the host's address (the answer must come back the same way)
+   forward              to and from the bridge, accepted
+```
+
+- **Wired up from both sides.** `minibox run` starts Init in a new network
+  namespace, and Init waits for its configuration. Meanwhile `minibox
+  run`, still in the host's namespace, leases an address, makes the veth
+  pair with one end created straight into Init's namespace as `eth0`
+  (`IFLA_NET_NS_PID`), puts the host end on the bridge and sets it up, and
+  adds the published ports. Then it sends the configuration, and Init,
+  inside, sets up loopback, gives eth0 its address, sets it up, adds the
+  default route, and writes `/etc/hosts` and `/etc/resolv.conf`.
+- **Netlink by hand** (`internal/netlink`): no netlink library and no `ip`
+  command. MiniBox builds each message itself: a 16-byte header, an
+  `ifinfomsg`, `ifaddrmsg` or `rtmsg`, and attributes, each a 4-byte
+  header and data padded to 4 bytes, nested for a veth's peer
+  (`IFLA_LINKINFO` > `IFLA_INFO_DATA` > `VETH_INFO_PEER` > a whole
+  `ifinfomsg` with attributes of its own). Every request asks for an
+  acknowledgement, and a refusal comes back as its errno (`EEXIST`,
+  `ENODEV`, ...).
+- **nftables through the `nft` command,** not by hand: nftables' own
+  netlink protocol is a bytecode for rules, far bigger than the few link,
+  address and route messages above. MiniBox has one table of its own,
+  written when it is missing; a published port is one element of a map,
+  added when its container starts and deleted when it ends, so nothing
+  else is rewritten. `route_localnet` on the bridge lets a connection to
+  the host's own `127.0.0.1` be sent on to a container. Changing the rules
+  means deleting the table while no container runs (`nft delete table ip
+  minibox`): they are not rewritten over an existing table.
+- **Addresses are leased** from `/run/minibox/leases.json` under a lock
+  (`flock`), so containers started at once get different ones: the lowest
+  free of .2-.254, recorded with the pid of the `minibox run` holding it
+  and when that process started. A lease whose holder has died (killed
+  outright, so it could not give it back) is taken back by the next
+  container to start, with its published ports; its veth went already,
+  with its namespace. The start time is there because pids are reused: a
+  new process with a dead holder's number would otherwise keep the lease
+  forever. `/run` is a tmpfs: leases do not outlive a reboot, and neither
+  do containers.
+- **DNS:** the host's resolvers, from systemd-resolved's list of upstream
+  servers when it runs, without any on loopback (the host's `127.0.0.53`
+  cannot be reached from a container's namespace).
+- **`--network none`** gives a network namespace with only loopback;
+  **`--network host`** no network namespace at all, and `-p` is refused
+  there.
+- **Ports:** `-p HOST:CONTAINER`, `-p PORT` (the same on both sides),
+  `/tcp` (the default) or `/udp`, repeatable. A port already published by
+  a running container is refused (125), and so is one a program on the
+  host holds (a TCP listener or a bound UDP socket, read from
+  `/proc/net/tcp`, `tcp6`, `udp` and `udp6`): DNAT happens before the
+  kernel looks for a socket, so publishing the VM's port 22 would quietly
+  take its SSH away. Docker's proxy would fail to bind the port instead. A
+  program that starts listening on a published port later gets nothing.
+
+**Not built:** IPv6, networks of your own, container names in DNS, port
+ranges, publishing on one host address only, and anything about other
+firewalls on the host. **With Docker on the same machine, traffic through
+the host is dropped:** Docker sets the `FORWARD` policy to DROP, and a
+packet must be accepted by every table, so MiniBox's own `accept` does not
+save it. Tried in the VM by setting that policy: traffic out to another
+machine, in through a published port, and from a container to a port
+published on the host's address all timed out, and `iptables -P FORWARD
+ACCEPT` brought them back. GitHub's runners have Docker, so CI sets that
+policy first (written, not yet run). Docker also loads `br_netfilter`,
+which sends traffic between containers on one bridge through the same
+rules; that case was not tried. With `--rootfs`, `/etc/hosts` and
+`/etc/resolv.conf` are written into that directory, since it is the
+container's filesystem (with an image they go into the container's own
+layer). Nothing about networking was measured: no throughput or latency
+figures exist.
+
 ## How a container starts
 
 ```
-minibox run ──► Run: checks the config, locks its OS thread, starts /proc/self/exe init
-   with CLONE_NEWUTS|NEWPID|NEWNS|NEWIPC, a session of its own, and Pdeathsig=SIGKILL
+minibox run ──► Run: checks the config, makes the cgroup, locks its OS thread, starts
+   /proc/self/exe init with CLONE_NEWUTS|NEWPID|NEWNS|NEWIPC|NEWCGROUP (and NEWNET unless
+   --network host), inside the cgroup, a session of its own, and Pdeathsig=SIGKILL
+   ──► attaches Init's network namespace to the bridge (a lease, the veth pair, ports)
    ──► sends the config as JSON on fd 3 ──► waits for one status message on fd 4
 minibox init (PID 1 in the new namespaces) ──► / made a private mount, so nothing travels back
    ──► the root filesystem bind-mounted on itself, then pivot_root(".", ".") and the old root
        detached: no path leads back to the host's files
-   ──► /proc, a /dev of its own, /sys read-only, the hostname ──► the command started
+   ──► /proc, a /dev of its own, /sys read-only, the hostname ──► loopback, eth0, the route,
+       /etc/hosts and /etc/resolv.conf ──► the command started
        (found in the container's PATH) ──► "started" on fd 4
    ──► until the command exits: every exit in the container reaped, forwarded signals passed on
    ──► exits with the command's status; the kernel kills whatever is left in the container
@@ -282,11 +380,12 @@ minibox init (PID 1 in the new namespaces) ──► / made a private mount, so 
 
 | | |
 |---|---|
-| Namespaces | its own UTS (hostname), PID, mount and IPC; the host's network, users and cgroups (Milestones 3-5) |
+| Namespaces | its own UTS (hostname), PID, mount, IPC, cgroup and network (unless `--network host`); the host's users (Milestone 5) |
 | `/` | the root filesystem directory, through `pivot_root`, with the old root detached |
 | `/proc` | its own (only its processes), `nosuid,nodev,noexec` |
 | `/dev` | a tmpfs with `null`, `zero`, `full`, `random`, `urandom`, `tty`, `fd`, `stdin`/`stdout`/`stderr`, `pts` (a new devpts instance), `ptmx`, `shm`, `mqueue`; none of the host's disks |
 | `/sys` | read-only |
+| Network | `lo` and `eth0` with its own address on the bridge, or only `lo` (`--network none`) |
 | Files open | 0, 1 and 2 only: Init's pipes to `minibox run` are closed on exec |
 
 A top-level `/proc`, `/dev` or `/sys` that is a symbolic link or a file is
@@ -295,9 +394,8 @@ link in the root filesystem could only point at something else inside it.
 
 **Not yet:** the command runs as root with every capability (it could
 mount filesystems, load kernel modules or reboot the VM: Milestone 5),
-shares the host's network (and `/sys` shows the host's network devices:
-Milestone 4), has no resource limits (Milestone 3) and no terminal of its
-own (`-t`): an interactive shell works, without job control.
+and has no terminal of its own (`-t`): an interactive shell works, without
+job control.
 
 ## How it is developed
 
@@ -389,11 +487,37 @@ own (`-t`): an interactive shell works, without job control.
   killed `minibox run` is swept once it is a minute old, a fresh one is
   not; and in a parent group made fresh, MiniBox enables the controllers
   itself. Through the CLI: the OOM message, `--stats`, and bad flags (125).
+- **Networking, in real containers:** eth0 has an address in
+  10.99.0.0/24 other than the bridge's, the default route goes through the
+  bridge, which answers a ping, `/etc/hosts` names the container and
+  `/etc/resolv.conf` has no loopback nameserver; a container serving HTTP
+  is reached by another through its address; a published port answers on
+  the host's `127.0.0.1` and on its own address, from **another machine**
+  (a network namespace on a veth to the host, standing for one: it must go
+  through the host's prerouting chain), and from **another container**
+  through the host's address on the bridge; the same port cannot be
+  published twice, and it stops answering, its rule gone, when the
+  container ends; the same other machine is reached from a container only
+  through masquerading (it has no route back to the bridge); eight
+  containers started at once get eight different addresses and give them
+  back with their veths; `--network none` has only `lo`, and it works;
+  `--network host` shares the host's namespace and refuses `-p`; a lease
+  whose holder died, or whose holder's pid now belongs to another process,
+  is taken back by the next container with its port; and when `minibox
+  run` is killed outright, its veth disappears with the container and its
+  lease is taken back by the next run. Without containers, against
+  processes in network namespaces of their own: four attaches held between
+  reading and writing the leases still get four addresses (the lock is all
+  that keeps them apart); detaching gives back the lease, the veth and the
+  port; a port held by a TCP listener or a bound UDP socket on the host is
+  refused, and published once it is let go. Netlink messages, attributes
+  and their padding and nesting, socket tables, and `-p` and `--network`
+  parsing have unit tests of their own.
 - **The command end to end** (`cmd/minibox`), with the test binary playing
   `minibox`: the default hostname is the id, usage errors are 125, Ctrl-C
   sent to `minibox run` ends the container with 130, and killing `minibox
   run` with `SIGKILL` takes the container with it.
-- **59 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
+- **94 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
   counted, filesystem names read from the wrong field, missing items
   inverted, cgroup v1 accepted, `check` exiting 0 on a failure), 16 in
   Milestone 1 (mounts not private, `chroot` for `pivot_root`, the old root
@@ -416,9 +540,21 @@ own (`-t`): an interactive shell works, without job control.
   writable, the group not removed, OOM kills read from the wrong field,
   fresh groups swept, tiny memory limits allowed, controllers not enabled
   in the parent, megabytes as 1,000,000, the OOM not reported, usage read
-  after the group was removed). Six were caught only after a fix
-  (failures 1-3 and 7).
-- **The smoke test** (`make smoke`, 27 checks): a static Linux binary,
+  after the group was removed) and 35 in Milestone 4 (attributes not
+  padded or not marked nested, message lengths unchecked, the kernel's
+  errors ignored, the veth's peer left on the host, the host's end not on
+  the bridge or not up, loopback or eth0 not up inside, no default route,
+  each of the three masquerade rules and both DNAT rules removed,
+  `route_localnet` or forwarding not turned on, the lease file not locked,
+  every container given the first address, ports or leases kept after the
+  container ends, dead holders' leases kept, a pid alone deciding a holder
+  is alive, a port published twice, loopback nameservers kept, `/etc/hosts`
+  or `/etc/resolv.conf` not written, no network namespace, one for
+  `--network host`, ports allowed off the bridge, port 0 accepted, Run
+  never detaching, a port in use on the host not checked, bound UDP
+  sockets not seen, socket table ports read as decimal). Eight were caught
+  only after a fix (failures 1-3, 7 and 14).
+- **The smoke test** (`make smoke`, 36 checks): a static Linux binary,
   `check` passing as root in the VM with no warnings, failing as an
   ordinary user and saying why, failing on the Mac and saying Linux is
   needed, usage errors exiting 2; real containers on a folder: their own
@@ -429,7 +565,12 @@ own (`-t`): an interactive shell works, without job control.
   folder or overlay left, `rmi` removing the layers, 125 for an image that
   is not there; and limits on that image: a 64 MiB buffer stopped by
   `--memory 32m` with the message, a fork bomb contained by `--pids 32`,
-  the container reading its own `memory.max`, no cgroup left.
+  the container reading its own `memory.max`, no cgroup left; and
+  networking: an address on the bridge, the internet reached by name from
+  a container (DNS and NAT), only loopback with `--network none`, and a
+  real `nginx:1.29-alpine` answering on a published port, stopped by
+  SIGINT, after which the port is closed, its rule gone, and no veth or
+  lease is left.
 - Each container in the tests takes about a second: the race detector
   sleeps 1 s when a process exits with status 0, and every Init is a copy
   of a race-enabled test binary.
@@ -495,6 +636,57 @@ own (`-t`): an interactive shell works, without job control.
    empty and removes it. Two changes made on the way stay: removing a
    group is retried while the kernel says it is busy, and a removal that
    fails is reported rather than ignored.
+9. **A merge that would have undone fixes.** The networking was first
+   written in a scratch copy of the project, made before Milestone 3's
+   last fixes. Copying it over would have quietly removed them (the busy
+   retry and error report on group removal, the kill test's cleanup, and a
+   Milestone 2 test), so it was merged change by change.
+10. **Containers could not reach each other's published ports through the
+    host's address.** Seen while reviewing the rules, then shown by a test
+    written for it, which timed out: the request is sent back into the
+    bridge it came from (DNAT), and the answer goes straight back across
+    the bridge, from the serving container's address, to a container that
+    had written to the host's. It is dropped. Docker calls the fix hairpin
+    NAT; here it is masquerading connections that were DNAT'd and leave
+    through the bridge, so the answer comes back through the host.
+11. **Three faults found by reading, not by a failing test.** A lease's
+    holder was recognised by its pid alone, and pids are reused, so a new
+    process could hold a dead container's address forever (now the start
+    time too, tested with a lease whose pid is alive but started at another
+    time). The function that gives back a container's network would have
+    reported a failure into a variable of its own (`att, err :=` inside a
+    `switch` makes a new `err`), so it would never have been seen (no test
+    makes that function fail; a comment guards it). And a test rewrote the
+    lease file without its lock while other packages' containers were
+    starting (it takes the lock now).
+12. **A smoke check that could not fail.** "The port is closed again"
+    passed even if the port's rule had stayed behind, since a connection
+    to an address that no longer exists fails too. It now also checks that
+    the rule is gone.
+13. **The planted-bug runs killed their own reset.** Each run first resets
+    the VM's network state, because the rules are written only when the
+    table is missing (otherwise a planted rule would be tested against the
+    old ones). The reset looked for leftover containers with `pgrep -f
+    minibox-init` and killed them, which matched the reset's own shell and
+    killed it before it deleted anything; the fix (`[m]inibox-init`) still
+    matched, through the shell's own `echo "... minibox-init ..."`. Both
+    runs were thrown away. Stopping the first one also left a planted bug in
+    the source, found by checking every plant's text afterwards; the runner
+    now puts the file back when it is stopped.
+14. **Two planted bugs passed the networking tests at first,** both gaps
+    in the tests. Not giving a lease back passed because the test compared
+    addresses as `ip` prints them, `10.99.0.2/24`, with the lease file's
+    `10.99.0.2`: "still leased" could never be true. Not locking the lease
+    file passed because eight containers starting at once never happened
+    to read and write the file at the same moment. The first test now
+    compares bare addresses and checks they are addresses; a new test
+    holds four attaches open between reading and writing the leases (a
+    hook only tests set), so without the lock they collide every time.
+    Both plants are caught on a re-run, with three new ones for the
+    port-in-use check. (The first plant of the full run also met two
+    containers left by the stopped run's tests, still finishing inside the
+    VM; the reset cleared them, and that plant is caught by a unit test
+    that does not depend on the VM.)
 
 ## Layout
 
@@ -510,9 +702,11 @@ own (`-t`): an interactive shell works, without job control.
 | `internal/image/extract_linux.go` | Unpacking a layer safely, with whiteouts as overlayfs reads them |
 | `internal/image/store.go` | The store: pull, list, remove, a container's overlay folders |
 | `internal/cgroup/` | A container's cgroup v2 group: limits, usage read back, removal, the sweep of stale groups |
+| `internal/netlink/` | Route netlink by hand: messages and attributes, links (bridge, veth), addresses, routes |
+| `internal/network/` | The bridge, leases, veth pairs, nftables NAT and published ports (host side); loopback, eth0, route, `/etc/hosts` and `/etc/resolv.conf` (inside) |
 | `bench/limits.sh`, `bench/results/` | The limits measured in the VM |
 | `internal/container/user.go` | Users and groups from the container's own `/etc/passwd` and `/etc/group` |
-| `internal/testutil/` | Root required (or a skip), the test root filesystem, the escape probe, a fake registry and layer builders |
+| `internal/testutil/` | Root required (or a skip), the test root filesystem, the probe (escape, memory, CPU, processes, HTTP server and client), a fake registry and layer builders |
 | `scripts/check_extraction/` | Unpacking real images by MiniBox and by GNU tar, compared |
 | `internal/host/` | `minibox check`: what the machine has, checked one item at a time |
 | `lima/minibox.yaml` | The development VM |

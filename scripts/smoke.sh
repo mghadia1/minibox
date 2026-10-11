@@ -57,6 +57,18 @@ check "--memory 32m stops a 64 MiB buffer, and says so" sh -c "limactl shell '$v
 check "--pids 32 contains a fork bomb" sh -c "limactl shell '$vm' $store run --pids 32 alpine:3.22 sh -c 'f() { f | f & }; f; sleep 2; echo survived' 2>/dev/null | grep -q survived"
 check "the container reads its own limits" sh -c "test \"\$(limactl shell '$vm' $store run --memory 32m alpine:3.22 cat /sys/fs/cgroup/memory.max)\" = 33554432"
 check "no container cgroup is left" sh -c "test -z \"\$(limactl shell '$vm' sh -c 'ls -d /sys/fs/cgroup/minibox/*/ 2>/dev/null')\""
+# Networking (Milestone 4), on the same image and a real web server.
+check "a container has its own address on the bridge" sh -c "limactl shell '$vm' $store run alpine:3.22 ip -4 -o addr show eth0 | grep -q ' 10\.99\.0\.'"
+check "it reaches the internet, by name (DNS and NAT)" in_vm $store run alpine:3.22 wget -q -T 10 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/
+check "--network none has only loopback" sh -c "test \"\$(limactl shell '$vm' $store run --network none alpine:3.22 sh -c 'ip -o link | wc -l')\" = 1"
+check "pull nginx:1.29-alpine" in_vm $store pull nginx:1.29-alpine
+in_vm sh -c "$store run -p 18080:80 nginx:1.29-alpine >/tmp/minibox-nginx.log 2>&1 &"
+# "[r]un": a pattern that does not match the pkill or pgrep looking for it.
+check "nginx answers on a published port" sh -c "limactl shell '$vm' sh -c 'for i in \$(seq 50); do curl -s -m 2 http://127.0.0.1:18080/ | grep -q \"Welcome to nginx\" && exit 0; sleep 0.2; done; exit 1'"
+check "Ctrl-C (SIGINT) stops it" sh -c "limactl shell '$vm' sudo pkill -INT -f '[r]un -p 18080:80 nginx' && limactl shell '$vm' sh -c 'for i in \$(seq 50); do pgrep -f \"[r]un -p 18080:80\" >/dev/null || exit 0; sleep 0.2; done; exit 1'"
+check "and the port is closed again, its rule gone" sh -c "! limactl shell '$vm' curl -s -m 2 http://127.0.0.1:18080/ && ! limactl shell '$vm' sudo nft list map ip minibox ports | grep -q 18080"
+check "no veth or lease is left" sh -c "! limactl shell '$vm' sh -c 'ip -o link | grep -q mbx' && limactl shell '$vm' sudo cat /run/minibox/leases.json | grep -qx '{}'"
+check "rmi nginx" in_vm $store rmi nginx:1.29-alpine
 check "rmi removes the image and its layers" sh -c "limactl shell '$vm' $store rmi alpine:3.22 && test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/layers)\""
 check "an image that is not here is 125" sh -c "limactl shell '$vm' $store run alpine:3.22 true 2>/dev/null; test \$? -eq 125"
 in_vm sudo rm -rf /var/tmp/minibox-smoke-store

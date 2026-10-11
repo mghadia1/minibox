@@ -36,8 +36,8 @@ func config(rootfs string, args ...string) Config {
 	if err != nil {
 		panic(err)
 	}
-	// A new id each time: a container's cgroup is named after it, and
-	// containers run at the same time (here and in other packages).
+	// A new id each time: a container's cgroup and veth are named after
+	// it, and containers run at the same time (here and in other packages).
 	return Config{ID: NewID(), Rootfs: rootfs, Hostname: "box", Args: args, Env: env, Cwd: "/"}
 }
 
@@ -76,8 +76,8 @@ func TestNamespaces(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Network and users are shared until Milestones 4 and 5.
-		own := slices.Contains([]string{"uts", "pid", "mnt", "ipc", "cgroup"}, n)
+		// Users are shared until Milestone 5.
+		own := slices.Contains([]string{"uts", "pid", "mnt", "ipc", "cgroup", "net"}, n)
 		if own == (inside[i] == host) {
 			t.Errorf("%s namespace: inside %s, host %s (should differ: %v)", n, inside[i], host, own)
 		}

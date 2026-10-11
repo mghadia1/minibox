@@ -33,6 +33,15 @@ jobs:
         id: rootfs
         run: echo "path=$(./scripts/rootfs.sh x86_64)" >> "$GITHUB_OUTPUT"
 
+      # The bridge network needs the nft command. And Docker, installed on
+      # these runners, sets the FORWARD policy to DROP: a packet must be
+      # accepted by every table, so MiniBox's own "accept" is not enough.
+      # The runner is thrown away after the job.
+      - name: network prerequisites
+        run: |
+          command -v nft || { sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends nftables; }
+          sudo iptables -P FORWARD ACCEPT
+
       # As root: namespaces, mounts and cgroups need it. MINIBOX_TEST_REQUIRE
       # turns tests that would skip without them into failures.
       - name: go test -race

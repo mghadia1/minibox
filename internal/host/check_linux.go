@@ -111,7 +111,7 @@ func checkUserNamespaces() Result {
 func checkNft() Result {
 	path, err := exec.LookPath("nft")
 	if err != nil {
-		return Result{"nftables", Warn, "nft not found: container networking (Milestone 4) will not work"}
+		return Result{"nftables", Warn, "nft not found: the bridge network will not work (--network none and host still do)"}
 	}
 	return Result{"nftables", OK, path}
 }

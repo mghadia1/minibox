@@ -5,10 +5,14 @@
 //	probe alloc MIB            allocate and touch MIB mebibytes, then exit
 //	probe spin SECONDS         keep one CPU busy for SECONDS of wall time
 //	probe spawn N              start up to N sleeping children; print how many started
+//	probe serve PORT           answer HTTP on PORT with "hello from HOSTNAME"
+//	probe get URL              print the body at URL (retrying for 3 s), or exit 1
 package main
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"syscall"
@@ -29,6 +33,10 @@ func main() {
 		spin(number(os.Args[2]))
 	case "spawn":
 		spawn(number(os.Args[2]))
+	case "serve":
+		serve(os.Args[2])
+	case "get":
+		get(os.Args[2])
 	default:
 		fmt.Fprintln(os.Stderr, "probe: unknown test", os.Args[1])
 		os.Exit(2)
@@ -108,4 +116,34 @@ func spawn(n int) {
 		started++
 	}
 	fmt.Println("started", started)
+}
+
+func serve(port string) {
+	name, _ := os.Hostname()
+	http.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprintf(w, "hello from %s", name)
+	})
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		fmt.Fprintln(os.Stderr, "probe:", err)
+		os.Exit(1)
+	}
+}
+
+func get(url string) {
+	client := http.Client{Timeout: time.Second}
+	var err error
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		var resp *http.Response
+		if resp, err = client.Get(url); err == nil {
+			body, rerr := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if rerr == nil {
+				fmt.Print(string(body))
+				return
+			}
+			err = rerr
+		}
+	}
+	fmt.Fprintln(os.Stderr, "probe:", err)
+	os.Exit(1)
 }

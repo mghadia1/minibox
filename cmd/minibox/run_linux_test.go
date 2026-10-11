@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mghadia1/minibox/internal/container"
+	"github.com/mghadia1/minibox/internal/network"
 	"github.com/mghadia1/minibox/internal/testutil"
 )
 
@@ -148,11 +150,34 @@ func TestContainerDiesWithMinibox(t *testing.T) {
 		t.Fatal(err)
 	}
 	group := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(strings.TrimSpace(string(own)), "0::"))
+	id := filepath.Base(group)
+	veth := network.HostVethName(id)
+	if !linkExists(veth) || !leased(t, id) {
+		t.Fatalf("the running container has no veth %s or no lease", veth)
+	}
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
 	waitForProcess(t, strings.Join(sleep, " "), false)
+	// Its veth pair went with its network namespace (the kernel removes
+	// a namespace's devices in the background: allow it a moment).
+	for deadline := time.Now().Add(5 * time.Second); linkExists(veth); time.Sleep(20 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the killed container's veth %s is still on the host", veth)
+		}
+	}
+	// Its lease is left, and taken back by the next container to start.
+	if !leased(t, id) {
+		t.Fatal("the killed container's lease is gone before any other container started")
+	}
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"run", "--rootfs", rootfs, "--", "/bin/true"}, nil, &stdout, &stderr); code != 0 {
+		t.Fatalf("the next container: exit %d, %s", code, stderr.String())
+	}
+	if leased(t, id) {
+		t.Error("the killed container's lease was not taken back by the next container")
+	}
 	// A killed `minibox run` cannot remove its group: it is left, empty,
 	// for a later run to sweep. Check nothing escaped it, then remove it
 	// here, so that no later test or smoke check finds it.
@@ -190,4 +215,33 @@ func TestLimitFlags(t *testing.T) {
 			t.Errorf("%q: exit %d, want 125 (%s)", bad, code, stderr.String())
 		}
 	}
+}
+
+func linkExists(name string) bool {
+	_, err := os.Stat(filepath.Join("/sys/class/net", name))
+	return err == nil
+}
+
+// leased reports whether the container id holds an address lease.
+func leased(t *testing.T, id string) bool {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(network.StateDir, "leases.json"))
+	if os.IsNotExist(err) {
+		return false
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	var leases map[string]struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(data, &leases); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range leases {
+		if l.ID == id {
+			return true
+		}
+	}
+	return false
 }
