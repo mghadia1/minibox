@@ -142,9 +142,52 @@ func TestContainerDiesWithMinibox(t *testing.T) {
 	sleep := marker()
 	cmd, _ := minibox(t, append([]string{"--rootfs", rootfs, "--"}, sleep...)...)
 	waitForProcess(t, strings.Join(sleep, " "), true)
+	// The container's cgroup, as the host sees it: "0::/minibox/ID".
+	own, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", findProcess(t, strings.Join(sleep, " "))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	group := filepath.Join("/sys/fs/cgroup", strings.TrimPrefix(strings.TrimSpace(string(own)), "0::"))
 	if err := cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_ = cmd.Wait()
 	waitForProcess(t, strings.Join(sleep, " "), false)
+	// A killed `minibox run` cannot remove its group: it is left, empty,
+	// for a later run to sweep. Check nothing escaped it, then remove it
+	// here, so that no later test or smoke check finds it.
+	events, err := os.ReadFile(filepath.Join(group, "cgroup.events"))
+	if err != nil {
+		t.Fatalf("the killed container's group %s: %v", group, err)
+	}
+	if !strings.Contains(string(events), "populated 0") {
+		t.Fatalf("processes are still in %s after the container died:\n%s", group, events)
+	}
+	if err := syscall.Rmdir(group); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLimitFlags(t *testing.T) {
+	testutil.RequireRoot(t)
+	rootfs := testutil.Rootfs(t)
+	testutil.Probe(t, rootfs)
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"run", "--rootfs", rootfs, "--memory", "48m", "--stats", "--", "/probe", "alloc", "200"}, nil, &stdout, &stderr)
+	if code != 128+9 || !strings.Contains(stderr.String(), "went over its memory limit (48.0 MiB)") || !strings.Contains(stderr.String(), "killed for memory 1") {
+		t.Fatalf("over the memory limit: exit %d, stderr %q", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = run([]string{"run", "--rootfs", rootfs, "--cpus", "0.5", "--pids", "64", "--stats", "--", "/bin/true"}, nil, &stdout, &stderr)
+	if code != 0 || !strings.Contains(stderr.String(), "minibox: cpu ") || strings.Contains(stderr.String(), "memory limit") {
+		t.Fatalf("within limits: exit %d, stderr %q", code, stderr.String())
+	}
+	for _, bad := range [][]string{{"--memory", "1m"}, {"--memory", "lots"}, {"--pids", "3"}, {"--cpus", "-1"}, {"--swap", "1g"}} {
+		stderr.Reset()
+		args := append(append([]string{"run", "--rootfs", rootfs}, bad...), "--", "/bin/true")
+		if code := run(args, nil, &stdout, &stderr); code != container.ExitSetup {
+			t.Errorf("%q: exit %d, want 125 (%s)", bad, code, stderr.String())
+		}
+	}
 }

@@ -7,12 +7,13 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** Milestones 0-2 of 7 built, on my machine (no GitHub
+> **Status:** Milestones 0-3 of 7 built, on my machine (no GitHub
 > repository yet, so CI has not run). `minibox pull alpine:3.22` fetches an
 > image from its registry, checking every digest, and unpacks its layers
 > safely; `minibox run alpine:3.22 sh` runs it on an overlay of those
-> layers, with its own hostname, process ids, mounts and IPC, under an
-> init that reaps and passes signals on. **It is not a security boundary
+> layers, with its own hostname, process ids, mounts, IPC and cgroup, under
+> an init that reaps and passes signals on, within memory, CPU and process
+> limits (`--memory`, `--cpus`, `--pids`). **It is not a security boundary
 > yet:** the command is root with every capability (unless the image or
 > `-u` names a user), and shares the host's network and users, until
 > Milestones 4 and 5.
@@ -30,7 +31,7 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 | 0 | Skeleton: Go module, `minibox` CLI, the Lima VM, tests in the VM as root, CI, a pinned test root filesystem | Built |
 | 1 | Isolation: namespaces, `pivot_root`, `/proc` and `/dev`, an init as PID 1 | Built |
 | 2 | Images: pulled from a registry and checked, safe layer extraction, overlayfs | Built |
-| 3 | Limits: cgroup v2 memory, CPU and pids; OOM kills reported | Not started |
+| 3 | Limits: cgroup v2 memory, CPU and pids; OOM kills reported | Built |
 | 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Not started |
 | 5 | Security: capabilities, `no_new_privs`, seccomp, masked paths, user namespaces | Not started |
 | 6 | The OCI runtime spec (a subset), compared with runc; start-up time measured | Not started |
@@ -179,6 +180,62 @@ if missing; its `User` (or `-u`), looked up in the container's own
 `/etc/passwd` and `/etc/group`, with the user's supplementary groups;
 `HOME` from that passwd entry.
 
+## Limits
+
+```bash
+minibox run --memory 256m --cpus 0.5 --pids 100 --stats alpine:3.22 sh
+```
+
+Every container gets a cgroup v2 group of its own,
+`/sys/fs/cgroup/minibox/ID`, made before the container exists and removed
+after it ends:
+
+| Flag | cgroup file | Means |
+|------|-------------|-------|
+| `--memory 256m` | `memory.max`; `memory.swap.max` 0 | over the limit, the kernel kills the largest process in the group (no swapping instead, unless `--swap` allows it) |
+| `--swap 512m` | `memory.swap.max` | swap on top of `--memory` |
+| `--cpus 0.5` | `cpu.max` "50000 100000" | half a CPU's time in every 100 ms period, however many threads |
+| `--pids 100` | `pids.max` | at most 100 processes and threads at once: `fork` fails with EAGAIN above it |
+
+- **Born inside its group:** Init is started with clone3's
+  `CLONE_INTO_CGROUP` (Go's `SysProcAttr.UseCgroupFD`), so no process of
+  the container ever runs outside its limits, not even between starting
+  and being moved.
+- **Its own view:** the container gets a cgroup namespace, so its group
+  is its `/` (`/proc/self/cgroup` reads `0::/`), mounted read-only at
+  `/sys/fs/cgroup`: it can read its own limits and usage, not change them.
+- **Afterwards:** what it used is read from the group (`memory.events`,
+  `memory.peak`, `cpu.stat`, `pids.events`). If the kernel killed a process
+  for memory, `minibox run` says so; `--stats` prints CPU time, time held
+  back by the CPU limit, peak memory and forks refused. Then anything still
+  in the group is killed (`cgroup.kill`) and the group removed. A group
+  left by a `minibox run` that was killed outright is removed by a later
+  one, once it is empty and over a minute old.
+- **Where:** `minibox` enables the cpu, memory and pids controllers for
+  its own groups (`cgroup.subtree_control`). It does not go through
+  systemd: on a machine where systemd should own every group, Docker's
+  systemd driver is the polite way, and this is not it.
+
+### Measured (2026-10-10)
+
+`bench/limits.sh` in the VM (Ubuntu 24.04, kernel 6.8, 2 CPUs), idle at
+the start (load 0.23): a probe keeping one thread busy for 5 s of wall
+time, three runs per setting (`bench/results/limits-20261010T082434Z.txt`):
+
+| `--cpus` | CPU used | Expected | Held back by the limit |
+|----------|----------|----------|------------------------|
+| 0.25 | 1.28-1.29 s | 1.25 s | 3.85-3.89 s |
+| 0.5 | 2.52-2.55 s | 2.5 s | 2.44-2.51 s |
+| 1 | 4.99 s | 5 s | 0.01-0.02 s |
+| none | 4.97-5.01 s | 5 s | 0 |
+
+The quota holds to within 3% (a little over, never under). Under
+`--memory 64m`, allocating and touching 16, 48 and 60 MiB ran (peak 23,
+55 and 64 MiB: the kernel took back cached file pages to fit the 60), and
+80 and 200 MiB were killed for memory (exit 137, one OOM kill each). One
+VM on one laptop: these say the limits work as written, not how they
+behave on a loaded server.
+
 ## How a container starts
 
 ```
@@ -320,11 +377,23 @@ own (`-t`): an interactive shell works, without job control.
   container's folder removed without `--keep`; no overlay mounted on the
   host while the container runs or after; `images`, and `rmi` removing the
   layers.
+- **Limits, in real containers:** the container reads its own limits at
+  `/sys/fs/cgroup` (and cannot write them) and sees its group as `/`; 200
+  MiB allocated under a 64 MiB limit is killed (137, one OOM kill counted)
+  while 24 MiB runs and its peak is read back; 100 processes asked for
+  under a limit of 32 start fewer than 32 and the refusals are counted; a
+  real fork bomb (`f() { f | f & }; f`) under a limit of 64 is contained,
+  the shell that started it carries on, and nothing of it is left; half a
+  CPU for 3 s of spinning uses about 1.5 s; limits too small are refused;
+  every container's group is gone afterwards; a group left empty by a
+  killed `minibox run` is swept once it is a minute old, a fresh one is
+  not; and in a parent group made fresh, MiniBox enables the controllers
+  itself. Through the CLI: the OOM message, `--stats`, and bad flags (125).
 - **The command end to end** (`cmd/minibox`), with the test binary playing
   `minibox`: the default hostname is the id, usage errors are 125, Ctrl-C
   sent to `minibox run` ends the container with 130, and killing `minibox
   run` with `SIGKILL` takes the container with it.
-- **44 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
+- **59 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
   counted, filesystem names read from the wrong field, missing items
   inverted, cgroup v1 accepted, `check` exiting 0 on a failure), 16 in
   Milestone 1 (mounts not private, `chroot` for `pivot_root`, the old root
@@ -341,9 +410,15 @@ own (`-t`): an interactive shell works, without job control.
   platform's architecture ignored, the token not kept, the image's user or
   entrypoint ignored, the size limit not enforced, shared layers removed,
   `HOME` not from passwd, mode set before owner, directory times never set,
-  the working directory not made). Five were caught only after a fix
-  (failures 1-3).
-- **The smoke test** (`make smoke`, 23 checks): a static Linux binary,
+  the working directory not made) and 15 in Milestone 3 (memory or pids
+  limit not written, swap allowed by default, the CPU quota off by ten,
+  Init not born in its group, no cgroup namespace, the container's cgroup
+  writable, the group not removed, OOM kills read from the wrong field,
+  fresh groups swept, tiny memory limits allowed, controllers not enabled
+  in the parent, megabytes as 1,000,000, the OOM not reported, usage read
+  after the group was removed). Six were caught only after a fix
+  (failures 1-3 and 7).
+- **The smoke test** (`make smoke`, 27 checks): a static Linux binary,
   `check` passing as root in the VM with no warnings, failing as an
   ordinary user and saying why, failing on the Mac and saying Linux is
   needed, usage errors exiting 2; real containers on a folder: their own
@@ -352,7 +427,9 @@ own (`-t`): an interactive shell works, without job control.
   a real image: `minibox pull alpine:3.22` from Docker Hub, `images`,
   Alpine 3.22 inside, a write that stays in its container, no container
   folder or overlay left, `rmi` removing the layers, 125 for an image that
-  is not there.
+  is not there; and limits on that image: a 64 MiB buffer stopped by
+  `--memory 32m` with the message, a fork bomb contained by `--pids 32`,
+  the container reading its own `memory.max`, no cgroup left.
 - Each container in the tests takes about a second: the race detector
   sleeps 1 s when a process exits with status 0, and every Init is a copy
   of a race-enabled test binary.
@@ -396,6 +473,28 @@ own (`-t`): an interactive shell works, without job control.
    left running" looked for any Init in the VM, but Go runs packages'
    tests at the same time, and the image tests' containers were still
    running. It now counts only Inits whose parent is its own test process.
+6. **Every test container had the same id.** The container tests named
+   every container "test", which was harmless until a container's cgroup
+   was named after its id: two containers at once (eight in a later test,
+   or a second test run in the VM) then collided on
+   `/sys/fs/cgroup/minibox/test`. Ids must be unique, and the tests now
+   draw a new one each time. The first planted-bug run of the limits
+   overlapped a run that collided like this, so its results were thrown
+   away and all 15 run again.
+7. **A planted bug hidden by what an earlier run left behind.** Not
+   enabling the controllers in MiniBox's parent group passed every test:
+   the VM still had that parent from earlier runs, with the controllers
+   on. A test now makes a parent of its own, so the step is needed.
+8. **The smoke test found a group left behind, but only sometimes.** "No
+   container cgroup is left" failed in 3 smoke runs and passed in others,
+   and no replay of its own steps left a group. The group came from the
+   test suite run just before: the test that kills `minibox run` outright
+   leaves that run's group, empty (a killed process cannot clean up), for
+   the next run to sweep a minute later, and the smoke test started within
+   that minute. The test now checks that the killed container's group is
+   empty and removes it. Two changes made on the way stay: removing a
+   group is retried while the kernel says it is busy, and a removal that
+   fails is reported rather than ignored.
 
 ## Layout
 
@@ -410,6 +509,8 @@ own (`-t`): an interactive shell works, without job control.
 | `internal/image/registry.go` | The registry client: bearer tokens, manifests and blobs, every digest checked |
 | `internal/image/extract_linux.go` | Unpacking a layer safely, with whiteouts as overlayfs reads them |
 | `internal/image/store.go` | The store: pull, list, remove, a container's overlay folders |
+| `internal/cgroup/` | A container's cgroup v2 group: limits, usage read back, removal, the sweep of stale groups |
+| `bench/limits.sh`, `bench/results/` | The limits measured in the VM |
 | `internal/container/user.go` | Users and groups from the container's own `/etc/passwd` and `/etc/group` |
 | `internal/testutil/` | Root required (or a skip), the test root filesystem, the escape probe, a fake registry and layer builders |
 | `scripts/check_extraction/` | Unpacking real images by MiniBox and by GNU tar, compared |

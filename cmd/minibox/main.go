@@ -28,6 +28,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/mghadia1/minibox/internal/cgroup"
 	"github.com/mghadia1/minibox/internal/container"
 	"github.com/mghadia1/minibox/internal/host"
 	"github.com/mghadia1/minibox/internal/image"
@@ -199,6 +200,12 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	workdir := fs.String("w", "", "working `directory` inside the container (default: the image's, or /)")
 	userSpec := fs.String("u", "", "run as `user`: name, uid, name:group or uid:gid (default: the image's, or root)")
 	keep := fs.Bool("keep", false, "keep the container's folder (its writable layer) after it exits")
+	stats := fs.Bool("stats", false, "print what the container used when it exits (CPU, memory, forks refused)")
+	var memory, swap bytesFlag
+	fs.Var(&memory, "memory", "memory limit (`size`: 512m, 1g); no swap unless --swap")
+	fs.Var(&swap, "swap", "swap allowed on top of --memory (`size`)")
+	cpus := fs.Float64("cpus", 0, "CPU limit, in CPUs (0.5 is half of one)")
+	pids := fs.Int64("pids", 0, "most processes and threads at once")
 	var entrypoint optionalString
 	fs.Var(&entrypoint, "entrypoint", "replace the image's entrypoint (`command`; \"\" for none)")
 	var env listFlag
@@ -220,7 +227,12 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if *hostname == "" {
 		*hostname = id
 	}
-	cfg := container.Config{ID: id, Hostname: *hostname, User: *userSpec}
+	cfg := container.Config{ID: id, Hostname: *hostname, User: *userSpec,
+		Limits: cgroup.Limits{Memory: memory.n, Swap: swap.n, CPUs: *cpus, Pids: *pids}}
+	if err := cfg.Limits.Validate(); err != nil {
+		fmt.Fprintln(stderr, "minibox:", err)
+		return container.ExitSetup
+	}
 	var imageEnv []string
 	var cleanup func()
 
@@ -298,14 +310,44 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	signal.Notify(signals, container.Forwarded...)
 	defer signal.Stop(signals)
 
-	code, err := container.Run(cfg, container.Stdio{In: stdin, Out: stdout, Err: stderr}, signals)
+	res, err := container.Run(cfg, container.Stdio{In: stdin, Out: stdout, Err: stderr}, signals)
 	if err != nil {
 		fmt.Fprintln(stderr, "minibox:", err)
 	}
 	if cleanup != nil {
 		cleanup()
 	}
-	return code
+	u := res.Usage
+	if u.OOMKills > 0 {
+		fmt.Fprintf(stderr, "minibox: the container went over its memory limit (%s): the kernel killed %d process(es)\n", humanBytes(cfg.Limits.Memory), u.OOMKills)
+	}
+	if *stats {
+		fmt.Fprintf(stderr, "minibox: cpu %.2f s (held back %.2f s by the limit), memory peak %s, killed for memory %d, forks refused %d\n",
+			u.CPUSeconds, u.Throttled, humanBytes(u.MemoryPeak), u.OOMKills, u.PidsRefused)
+	}
+	return res.Code
+}
+
+func humanBytes(n int64) string {
+	switch {
+	case n >= 1<<30:
+		return fmt.Sprintf("%.1f GiB", float64(n)/(1<<30))
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KiB", float64(n)/(1<<10))
+	}
+	return fmt.Sprintf("%d B", n)
+}
+
+// bytesFlag is a size flag: "512m", "1g".
+type bytesFlag struct{ n int64 }
+
+func (b *bytesFlag) String() string { return fmt.Sprint(b.n) }
+func (b *bytesFlag) Set(v string) error {
+	n, err := cgroup.ParseBytes(v)
+	b.n = n
+	return err
 }
 
 // imageArgs is what an image runs, as Docker decides it: the entrypoint

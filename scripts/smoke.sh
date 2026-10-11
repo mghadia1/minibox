@@ -52,6 +52,11 @@ check "run it: Alpine 3.22 inside" sh -c "limactl shell '$vm' $store run alpine:
 check "a write stays in its container" sh -c "limactl shell '$vm' $store run alpine:3.22 sh -c 'echo x > /etc/written'; limactl shell '$vm' $store run alpine:3.22 test ! -e /etc/written"
 check "no container folder is left" sh -c "test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/containers)\""
 check "no overlay is left mounted" sh -c "! limactl shell '$vm' grep -q minibox-smoke-store /proc/self/mountinfo"
+# Limits (Milestone 3), on the same image.
+check "--memory 32m stops a 64 MiB buffer, and says so" sh -c "limactl shell '$vm' $store run --memory 32m alpine:3.22 dd if=/dev/zero of=/dev/null bs=64M count=1 2>&1 | grep -q 'went over its memory limit'"
+check "--pids 32 contains a fork bomb" sh -c "limactl shell '$vm' $store run --pids 32 alpine:3.22 sh -c 'f() { f | f & }; f; sleep 2; echo survived' 2>/dev/null | grep -q survived"
+check "the container reads its own limits" sh -c "test \"\$(limactl shell '$vm' $store run --memory 32m alpine:3.22 cat /sys/fs/cgroup/memory.max)\" = 33554432"
+check "no container cgroup is left" sh -c "test -z \"\$(limactl shell '$vm' sh -c 'ls -d /sys/fs/cgroup/minibox/*/ 2>/dev/null')\""
 check "rmi removes the image and its layers" sh -c "limactl shell '$vm' $store rmi alpine:3.22 && test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/layers)\""
 check "an image that is not here is 125" sh -c "limactl shell '$vm' $store run alpine:3.22 true 2>/dev/null; test \$? -eq 125"
 in_vm sudo rm -rf /var/tmp/minibox-smoke-store

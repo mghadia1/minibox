@@ -131,6 +131,9 @@ func mountSpecial() error {
 		{"mqueue", "/dev/mqueue", "mqueue", nosuid | nodev | noexec, ""},
 		// Read-only: /sys is the host kernel's, not the container's.
 		{"sysfs", "/sys", "sysfs", unix.MS_RDONLY | nosuid | nodev | noexec, ""},
+		// The container's own cgroup, read-only: in its cgroup namespace
+		// it is the root, so it can read its limits and usage.
+		{"cgroup2", "/sys/fs/cgroup", "cgroup2", unix.MS_RDONLY | nosuid | nodev | noexec, ""},
 	}
 	for _, m := range mounts {
 		if err := os.MkdirAll(m.target, 0o755); err != nil {

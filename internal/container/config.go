@@ -17,6 +17,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"github.com/mghadia1/minibox/internal/cgroup"
 )
 
 // Config is everything Init needs, sent from Run as JSON.
@@ -39,6 +41,10 @@ type Config struct {
 	// looked up in the container's own /etc/passwd and /etc/group. Empty
 	// is root.
 	User string `json:"user,omitempty"`
+
+	// Limits for the container's cgroup, applied by Run before Init
+	// starts (Init never sees them).
+	Limits cgroup.Limits `json:"-"`
 }
 
 // Exit codes for a container that could not be run, as Docker gives them:
@@ -117,6 +123,9 @@ func (c Config) Validate() error {
 		return fmt.Errorf("working directory %q is not an absolute path", c.Cwd)
 	case c.Hostname == "" || len(c.Hostname) > hostnameMaxLength:
 		return fmt.Errorf("hostname %q must be 1 to %d characters", c.Hostname, hostnameMaxLength)
+	}
+	if err := c.Limits.Validate(); err != nil {
+		return err
 	}
 	if len(c.Lower) > 0 {
 		// overlayfs reads its options as "lowerdir=a:b,upperdir=...".

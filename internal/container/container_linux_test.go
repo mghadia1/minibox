@@ -36,14 +36,16 @@ func config(rootfs string, args ...string) Config {
 	if err != nil {
 		panic(err)
 	}
-	return Config{ID: "test", Rootfs: rootfs, Hostname: "box", Args: args, Env: env, Cwd: "/"}
+	// A new id each time: a container's cgroup is named after it, and
+	// containers run at the same time (here and in other packages).
+	return Config{ID: NewID(), Rootfs: rootfs, Hostname: "box", Args: args, Env: env, Cwd: "/"}
 }
 
 func runConfig(t *testing.T, cfg Config, stdin string, signals <-chan os.Signal) result {
 	t.Helper()
 	var stdout, stderr bytes.Buffer
-	code, err := Run(cfg, Stdio{In: strings.NewReader(stdin), Out: &stdout, Err: &stderr}, signals)
-	return result{stdout.String(), stderr.String(), code, err}
+	res, err := Run(cfg, Stdio{In: strings.NewReader(stdin), Out: &stdout, Err: &stderr}, signals)
+	return result{stdout.String(), stderr.String(), res.Code, err}
 }
 
 // sh runs a shell command in a fresh container on rootfs.
@@ -74,9 +76,8 @@ func TestNamespaces(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Milestone 1 isolates these four; network and users are shared
-		// until Milestones 4 and 5.
-		own := slices.Contains([]string{"uts", "pid", "mnt", "ipc"}, n)
+		// Network and users are shared until Milestones 4 and 5.
+		own := slices.Contains([]string{"uts", "pid", "mnt", "ipc", "cgroup"}, n)
 		if own == (inside[i] == host) {
 			t.Errorf("%s namespace: inside %s, host %s (should differ: %v)", n, inside[i], host, own)
 		}
@@ -155,7 +156,7 @@ func TestRootIsTheRootfs(t *testing.T) {
 			points = append(points, f[4])
 		}
 	}
-	want := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/shm", "/dev/mqueue", "/sys"}
+	want := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/shm", "/dev/mqueue", "/sys", "/sys/fs/cgroup"}
 	if !slices.Equal(points, want) {
 		t.Fatalf("mount points inside = %q, want %q", points, want)
 	}

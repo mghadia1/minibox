@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"runtime"
+
+	"github.com/mghadia1/minibox/internal/cgroup"
 )
 
 // Forwarded is empty where containers cannot run.
@@ -26,9 +28,15 @@ type SetupError struct {
 
 func (e *SetupError) Error() string { return e.Message }
 
+// Result is how a container ended, and what it used.
+type Result struct {
+	Code  int
+	Usage cgroup.Usage
+}
+
 // Run fails anywhere but Linux.
-func Run(Config, Stdio, <-chan os.Signal) (int, error) {
-	return ExitSetup, &SetupError{ExitSetup, fmt.Sprintf("containers need Linux, not %s (on a Mac, the Lima VM in lima/minibox.yaml)", runtime.GOOS)}
+func Run(Config, Stdio, <-chan os.Signal) (Result, error) {
+	return Result{Code: ExitSetup}, &SetupError{ExitSetup, fmt.Sprintf("containers need Linux, not %s (on a Mac, the Lima VM in lima/minibox.yaml)", runtime.GOOS)}
 }
 
 // Init fails anywhere but Linux.
