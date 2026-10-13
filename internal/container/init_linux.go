@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -83,6 +84,15 @@ func Init() {
 	attr := &syscall.ProcAttr{Dir: cfg.Cwd, Env: env, Files: []uintptr{0, 1, 2}}
 	if cfg.User != "" {
 		attr.Sys = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: creds.UID, Gid: creds.GID, Groups: creds.Groups}}
+	}
+	// Harden on a locked OS thread, then fork from the same thread: the
+	// command inherits this thread's reduced capabilities, bounding set,
+	// no_new_privs and seccomp filter (all per-thread, passed on by the
+	// fork). Everything privileged (mounts, hostname, the network) is
+	// done above, with full capabilities.
+	runtime.LockOSThread()
+	if err := harden(); err != nil {
+		fail(ExitSetup, fmt.Errorf("hardening the container: %w", err))
 	}
 	child, err := syscall.ForkExec(file, cfg.Args, attr)
 	if err != nil {

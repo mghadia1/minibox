@@ -7,7 +7,7 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** Milestones 0-4 of 7 built, on my machine (the GitHub
+> **Status:** Milestones 0-5 of 7 built, on my machine (the GitHub
 > repository is empty, so CI has not run). `minibox pull alpine:3.22`
 > fetches an image from its registry, checking every digest, and unpacks
 > its layers safely; `minibox run alpine:3.22 sh` runs it on an overlay of
@@ -15,9 +15,13 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 > network, under an init that reaps and passes signals on, within memory,
 > CPU and process limits (`--memory`, `--cpus`, `--pids`). Each container
 > has its own address on a bridge, reaches the internet through the host,
-> and can publish ports (`-p 8080:80`). **It is not a security boundary
-> yet:** the command is root with every capability (unless the image or
-> `-u` names a user) and shares the host's users, until Milestone 5.
+> and can publish ports (`-p 8080:80`). The command runs with a small
+> capability set, `no_new_privs`, a hand-written seccomp filter, and masked
+> and read-only `/proc` and `/sys` paths; `--userns` gives it its own user
+> namespace, so its root is an unprivileged user on the host. **It is still
+> not something to trust with hostile code:** it has no devices cgroup, one
+> shared bridge, and the user namespace does not id-map the root filesystem
+> (see Security).
 
 > **Where it runs:** Linux only, as root. On my Mac that is a Lima VM
 > (`lima/minibox.yaml`: Ubuntu 24.04, 2 CPUs, 2 GiB, 10 GiB disk); in CI,
@@ -35,7 +39,7 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 | 2 | Images: pulled from a registry and checked, safe layer extraction, overlayfs | Built |
 | 3 | Limits: cgroup v2 memory, CPU and pids; OOM kills reported | Built |
 | 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Built |
-| 5 | Security: capabilities, `no_new_privs`, seccomp, masked paths, user namespaces | Not started |
+| 5 | Security: capabilities cut, `no_new_privs`, a hand-written seccomp filter, masked paths, an optional user namespace | Built |
 | 6 | The OCI runtime spec (a subset), compared with runc; start-up time measured | Not started |
 | 7 | README: diagram, decisions, failures, results; explain-it-yourself prompts | Not started |
 
@@ -100,7 +104,9 @@ KEY=value` (repeatable), `-w DIR` (the working directory inside), `-u
 USER` (a name, uid, `name:group` or `uid:gid`, looked up in the
 container's own `/etc/passwd` and `/etc/group`), `--entrypoint` (replaces
 the image's; `""` for none), `--keep` (keep the container's writable layer
-after it exits). The exit code is the command's, or 128 + the signal that
+after it exits), `--memory`/`--swap`/`--cpus`/`--pids` (limits),
+`--network bridge|none|host` and `-p HOST:CONTAINER` (networking), and
+`--userns` (a user namespace). The exit code is the command's, or 128 + the signal that
 ended it; 125 when MiniBox could not run the container, 126 when the
 command could not be invoked, 127 when it was not found (Docker's codes).
 With `--rootfs`, the command writes straight into that directory; with an
@@ -331,20 +337,97 @@ container's filesystem (with an image they go into the container's own
 layer). Nothing about networking was measured: no throughput or latency
 figures exist.
 
+## Security
+
+Before the command is exec'd, Init hardens it. Everything privileged (the
+mounts, the hostname, the network) is done first, with full capabilities;
+then, on a locked OS thread so the fork for the command inherits exactly
+this state, Init cuts capabilities, sets `no_new_privs`, and installs a
+seccomp filter.
+
+```bash
+minibox run alpine:3.22 sh         # a small capability set, seccomp, masked /proc
+minibox run --userns alpine:3.22 sh # and its own user namespace: root here is nobody on the host
+```
+
+- **Capabilities: Docker's default set, minus two.** The command keeps the
+  twelve capabilities a normal program expects (file permissions,
+  setuid/setgid to drop to a user, chroot, kill, binding low ports,
+  audit). MiniBox drops two that Docker keeps:
+  - **`CAP_NET_RAW`** — every bridged container shares one bridge with no
+    per-container packet filtering, so a raw or packet socket could sniff
+    or spoof its neighbours. The cost: `ping` does not work.
+  - **`CAP_MKNOD`** — MiniBox has no devices cgroup, so a device node the
+    container made (`mknod /dev/sda b 8 0`) would read the host's disks.
+    Docker keeps `CAP_MKNOD` only because it pairs it with a devices
+    cgroup that denies access to anything so created.
+
+  The whole set is dropped from the **bounding set** too, so no capability
+  can be regained by exec'ing a set-user-id or file-capability binary. A
+  command that runs as a non-root user (`-u`) keeps **no** capabilities at
+  all — the point of running as a user, and what Docker does.
+- **`no_new_privs`** stops a set-user-id or file-capability binary the
+  command exec's from gaining anything beyond that set, and lets the
+  seccomp filter load without `CAP_SYS_ADMIN`.
+- **A seccomp filter written by hand** (`internal/container/security_linux.go`):
+  a classic-BPF program, not libseccomp. It reads the architecture from
+  `seccomp_data` and kills the process if it is not this build's, so a
+  second ABI cannot reach the kernel with system-call numbers the filter
+  never checked; then it returns `EPERM` for a hand-picked subset of
+  Docker's denied calls — loading or unloading kernel modules, `kexec`,
+  `open_by_handle_at`, `perf_event_open`, `reboot`, swap, and the kernel
+  keyring (`add_key`, `keyctl`, `request_key`). Most are also blocked by a
+  missing capability; the filter is a second line. The keyring calls need
+  **no** capability, so there the filter is the only thing stopping them —
+  the test proves it.
+- **Masked and read-only paths,** as Docker does: `/proc/kcore`,
+  `/proc/keys`, the timer and scheduler files, `/sys/firmware` and the
+  rest are covered (a file with `/dev/null`, a directory with an empty
+  read-only tmpfs); `/proc/bus`, `/proc/fs`, `/proc/irq`, `/proc/sys` and
+  `/proc/sysrq-trigger` are made read-only, so a process cannot retune or
+  crash the host kernel. These are set up inside the root filesystem
+  before `pivot_root`.
+- **`--userns`: an optional user namespace.** The container's ids 0-65535
+  map to host ids 100000-165535, so the container's root is an
+  unprivileged user on the host — if it escaped the other controls it
+  would still own nothing outside the namespace. `minibox run` is real
+  root, so it writes the mapping directly (no `newuidmap`, no
+  `/etc/subuid`). The device nodes are bind-mounted from the host's `/dev`
+  rather than created with `mknod`, which a user namespace forbids. The
+  capability, `no_new_privs` and seccomp hardening still applies, so even
+  the namespace's root cannot mount or load a module.
+
+**Known gaps — this is a learning runtime, not a sandbox for hostile
+code:**
+
+- **No devices cgroup** (so `CAP_MKNOD` is dropped rather than contained)
+  and **no AppArmor or SELinux profile.**
+- **The user namespace does not id-map the root filesystem.** The
+  rootfs's files stay owned by the host's root, which is unmapped inside,
+  so the container's root sees them as `nobody` and cannot modify a
+  root-owned file; `/etc/hosts` and `/etc/resolv.conf` are left as the
+  image shipped them (the network is still set up). The fix is an
+  id-mapped mount (`mount_setattr` with `MOUNT_ATTR_IDMAP`), which needs a
+  helper user namespace and a mount moved across the clone boundary — not
+  built. Without `--userns` this does not arise (Init is real root).
+- The seccomp denial list is a subset of Docker's, chosen for the calls
+  with a clear cost and no use in an ordinary program; it is not the whole
+  profile, and it has no per-argument rules.
+
 ## How a container starts
 
 ```
 minibox run ──► Run: checks the config, makes the cgroup, locks its OS thread, starts
    /proc/self/exe init with CLONE_NEWUTS|NEWPID|NEWNS|NEWIPC|NEWCGROUP (and NEWNET unless
-   --network host), inside the cgroup, a session of its own, and Pdeathsig=SIGKILL
+   --network host, NEWUSER if --userns), inside the cgroup, a session of its own, Pdeathsig=SIGKILL
    ──► attaches Init's network namespace to the bridge (a lease, the veth pair, ports)
    ──► sends the config as JSON on fd 3 ──► waits for one status message on fd 4
 minibox init (PID 1 in the new namespaces) ──► / made a private mount, so nothing travels back
-   ──► the root filesystem bind-mounted on itself, then pivot_root(".", ".") and the old root
-       detached: no path leads back to the host's files
-   ──► /proc, a /dev of its own, /sys read-only, the hostname ──► loopback, eth0, the route,
-       /etc/hosts and /etc/resolv.conf ──► the command started
-       (found in the container's PATH) ──► "started" on fd 4
+   ──► the root filesystem bind-mounted on itself; /proc, a /dev of its own, /sys read-only and
+       the masks mounted inside it; then pivot_root(".", ".") and the old root detached
+   ──► the hostname ──► loopback, eth0, the route, /etc/hosts and /etc/resolv.conf
+   ──► on a locked thread: capabilities cut, no_new_privs, the seccomp filter ──► the command
+       started (found in the container's PATH), inheriting that ──► "started" on fd 4
    ──► until the command exits: every exit in the container reaped, forwarded signals passed on
    ──► exits with the command's status; the kernel kills whatever is left in the container
 ```
@@ -380,22 +463,25 @@ minibox init (PID 1 in the new namespaces) ──► / made a private mount, so 
 
 | | |
 |---|---|
-| Namespaces | its own UTS (hostname), PID, mount, IPC, cgroup and network (unless `--network host`); the host's users (Milestone 5) |
+| Namespaces | its own UTS (hostname), PID, mount, IPC, cgroup and network (unless `--network host`), and its own user namespace with `--userns`; otherwise the host's users |
 | `/` | the root filesystem directory, through `pivot_root`, with the old root detached |
-| `/proc` | its own (only its processes), `nosuid,nodev,noexec` |
+| `/proc` | its own (only its processes), `nosuid,nodev,noexec`; the host-revealing paths masked, the kernel-tuning paths read-only |
 | `/dev` | a tmpfs with `null`, `zero`, `full`, `random`, `urandom`, `tty`, `fd`, `stdin`/`stdout`/`stderr`, `pts` (a new devpts instance), `ptmx`, `shm`, `mqueue`; none of the host's disks |
 | `/sys` | read-only |
 | Network | `lo` and `eth0` with its own address on the bridge, or only `lo` (`--network none`) |
+| Capabilities | a small set (see Security), `no_new_privs`, a seccomp filter; none at all when it runs as a non-root user |
 | Files open | 0, 1 and 2 only: Init's pipes to `minibox run` are closed on exec |
 
 A top-level `/proc`, `/dev` or `/sys` that is a symbolic link or a file is
-refused. The special filesystems are mounted after `pivot_root`, so any
-link in the root filesystem could only point at something else inside it.
+refused; the special filesystems are mounted into the root filesystem
+before `pivot_root` (a fresh procfs or sysfs can be mounted in a user
+namespace only while a fully visible one is still in the tree), and every
+other path then sits inside one of those new mounts, so a link in the
+image cannot redirect a mount out of the root filesystem.
 
-**Not yet:** the command runs as root with every capability (it could
-mount filesystems, load kernel modules or reboot the VM: Milestone 5),
-and has no terminal of its own (`-t`): an interactive shell works, without
-job control.
+**Not yet:** the command has no terminal of its own (`-t`): an interactive
+shell works, without job control. And see Security for what the hardening
+does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
 
 ## How it is developed
 
@@ -488,8 +574,8 @@ job control.
   not; and in a parent group made fresh, MiniBox enables the controllers
   itself. Through the CLI: the OOM message, `--stats`, and bad flags (125).
 - **Networking, in real containers:** eth0 has an address in
-  10.99.0.0/24 other than the bridge's, the default route goes through the
-  bridge, which answers a ping, `/etc/hosts` names the container and
+  10.99.0.0/24 other than the bridge's and is up, the default route goes
+  through the bridge, `/etc/hosts` names the container and
   `/etc/resolv.conf` has no loopback nameserver; a container serving HTTP
   is reached by another through its address; a published port answers on
   the host's `127.0.0.1` and on its own address, from **another machine**
@@ -513,6 +599,19 @@ job control.
   refused, and published once it is let go. Netlink messages, attributes
   and their padding and nesting, socket tables, and `-p` and `--network`
   parsing have unit tests of their own.
+- **Security, in real containers:** the command's effective capabilities
+  and its bounding set are exactly the expected mask, `no_new_privs` is
+  set and seccomp is in filter mode; a non-root command (`-u`) has no
+  capabilities; mounting, `open_by_handle_at`, loading a kernel module,
+  `mknod` of a block device, a raw or packet socket, and a write to
+  `/proc/sysrq-trigger` are each refused, and so is `keyctl` (which needs
+  no capability, so only the filter stops it — it shows the filter does
+  something the capability drop does not); `/proc/kcore` reads empty while
+  `/proc/sys` still reads. With `--userns`: the container's root is uid 0
+  inside, the uid map is 0 → the host's unprivileged range, a bind-mounted
+  `/dev/null` works, and mounting is still refused (the hardening does not
+  depend on the user namespace); and running an image under `--userns`
+  is refused (the image store is the host root's).
 - **The command end to end** (`cmd/minibox`), with the test binary playing
   `minibox`: the default hostname is the id, usage errors are 125, Ctrl-C
   sent to `minibox run` ends the container with 130, and killing `minibox
@@ -554,7 +653,7 @@ job control.
   never detaching, a port in use on the host not checked, bound UDP
   sockets not seen, socket table ports read as decimal). Eight were caught
   only after a fix (failures 1-3, 7 and 14).
-- **The smoke test** (`make smoke`, 36 checks): a static Linux binary,
+- **The smoke test** (`make smoke`, 46 checks): a static Linux binary,
   `check` passing as root in the VM with no warnings, failing as an
   ordinary user and saying why, failing on the Mac and saying Linux is
   needed, usage errors exiting 2; real containers on a folder: their own
@@ -570,7 +669,11 @@ job control.
   a container (DNS and NAT), only loopback with `--network none`, and a
   real `nginx:1.29-alpine` answering on a published port, stopped by
   SIGINT, after which the port is closed, its rule gone, and no veth or
-  lease is left.
+  lease is left; and security: the container cannot mount or ping (caps
+  dropped), `no_new_privs` and seccomp are on, `/proc/kcore` is empty and
+  `/proc/sysrq-trigger` is read-only, and a `--userns` container is uid 0
+  inside, maps to the host's unprivileged range, and the host sees its
+  process running as that high uid.
 - Each container in the tests takes about a second: the race detector
   sleeps 1 s when a process exits with status 0, and every Init is a copy
   of a race-enabled test binary.
@@ -687,6 +790,45 @@ job control.
     containers left by the stopped run's tests, still finishing inside the
     VM; the reset cleared them, and that plant is caught by a unit test
     that does not depend on the VM.)
+15. **The seccomp filter was rejected with EINVAL.** Each compare in the
+    hand-built BPF program jumps forward to the "deny" return, and the
+    jump distance was computed as `errnoIndex - (len(filter) + i) - 1` —
+    but `len(filter)` already grows as instructions are appended, so the
+    index was counted twice and the jumps pointed past the end of the
+    program, which the kernel refuses. The landing index of a new
+    instruction is just `len(filter)`; with that the offsets are right.
+    Guards: the capabilities test checks the filter is installed (seccomp
+    mode 2), and the `keyctl` escape test checks a denial actually fires
+    (keyctl needs no capability, so only the filter can stop it).
+16. **User namespaces took three goes, and one limit remains.** (a) The
+    container's root showed as `nobody` and could not mount or set up its
+    network: its host uid was outside the mapped range, so it was
+    unmapped, and the capabilities it held as the namespace's creator were
+    lost at the exec into `minibox-init` (that exec ran as the unmapped,
+    non-root uid). Fixed by having Go change to uid 0 — via a `Credential`
+    on the clone — after it writes the id maps and before that exec, so
+    Init runs as the namespace's root with its capabilities. (b) Then
+    mounting `/proc` failed: a fresh procfs may be mounted in a user
+    namespace only while a fully visible one is still in the mount tree,
+    and MiniBox mounted it after `pivot_root` had detached the host's.
+    Fixed by mounting `/proc`, `/dev` and `/sys` into the root filesystem
+    *before* pivoting (which also let the device nodes be bind-mounted
+    straight from the host's `/dev`). (c) The remaining limit — the root
+    filesystem is not id-mapped, so its root-owned files are `nobody`
+    inside and the container's root cannot rewrite `/etc/hosts` — is
+    documented in Security, not fixed; the file writes are best-effort in
+    a user namespace.
+17. **The hardening broke tests that assumed an all-powerful container.**
+    Dropping `CAP_NET_RAW` stopped `ping` (used by two network tests to
+    check reachability); dropping `CAP_SYS_ADMIN` stopped a command
+    changing the hostname or mounting; and the new masks added mounts a
+    test counted exactly. These were the hardening working: the tests were
+    updated to the new behaviour (reachability is checked over TCP by the
+    container-to-container and NAT tests; the interface is checked for its
+    up state; a command's mount and hostname change are asserted to be
+    refused; the extra mounts are checked to be only `/proc` and `/sys`
+    masks). The behaviour matches Docker, whose default also drops
+    `CAP_SYS_ADMIN` and whose `--user` default adds no capabilities.
 
 ## Layout
 
@@ -696,7 +838,8 @@ job control.
 | `internal/container/config.go`, `lookpath.go` | A container's configuration and environment; finding the command in the container's PATH |
 | `internal/container/run_linux.go` | `minibox run`'s side: starting Init in new namespaces, the config and status pipes, passing signals on, exit codes |
 | `internal/container/init_linux.go` | Init, PID 1: setting up, starting the command, reaping, forwarding signals |
-| `internal/container/rootfs_linux.go` | Private mounts, `pivot_root`, `/proc`, `/dev`, `/sys` |
+| `internal/container/rootfs_linux.go` | Private mounts, `/proc`, `/dev`, `/sys` and the masks, `pivot_root`, user-namespace device bind-mounts |
+| `internal/container/security_linux.go`, `seccomp_{arm64,amd64}.go` | Capabilities, `no_new_privs`, the hand-written seccomp filter, the per-architecture audit value |
 | `internal/image/reference.go`, `oci.go` | Image names as Docker reads them; OCI and Docker manifest types; choosing this machine's platform |
 | `internal/image/registry.go` | The registry client: bearer tokens, manifests and blobs, every digest checked |
 | `internal/image/extract_linux.go` | Unpacking a layer safely, with whiteouts as overlayfs reads them |

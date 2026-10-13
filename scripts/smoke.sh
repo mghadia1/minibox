@@ -69,6 +69,24 @@ check "Ctrl-C (SIGINT) stops it" sh -c "limactl shell '$vm' sudo pkill -INT -f '
 check "and the port is closed again, its rule gone" sh -c "! limactl shell '$vm' curl -s -m 2 http://127.0.0.1:18080/ && ! limactl shell '$vm' sudo nft list map ip minibox ports | grep -q 18080"
 check "no veth or lease is left" sh -c "! limactl shell '$vm' sh -c 'ip -o link | grep -q mbx' && limactl shell '$vm' sudo cat /run/minibox/leases.json | grep -qx '{}'"
 check "rmi nginx" in_vm $store rmi nginx:1.29-alpine
+# Security (Milestone 5): capabilities, no_new_privs, seccomp, masks, userns.
+check "no CAP_SYS_ADMIN: the container cannot mount" sh -c "! limactl shell '$vm' $store run alpine:3.22 sh -c 'mkdir -p /dev/shm/m && mount -t tmpfs none /dev/shm/m'"
+check "no CAP_NET_RAW: ping has no raw socket" sh -c "! limactl shell '$vm' $store run alpine:3.22 ping -c 1 -W 1 10.99.0.1"
+check "no_new_privs is set" sh -c "limactl shell '$vm' $store run alpine:3.22 grep -Eq 'NoNewPrivs:[[:space:]]*1' /proc/self/status"
+check "a seccomp filter is installed" sh -c "limactl shell '$vm' $store run alpine:3.22 grep -Eq 'Seccomp:[[:space:]]*2' /proc/self/status"
+check "/proc/kcore is masked (reads empty)" sh -c "limactl shell '$vm' $store run alpine:3.22 sh -c 'test ! -s /proc/kcore'"
+check "/proc/sysrq-trigger is read-only" sh -c "! limactl shell '$vm' $store run alpine:3.22 sh -c 'echo 1 > /proc/sysrq-trigger'"
+# --userns uses --rootfs: an image's store and layers are the host root's,
+# which the mapped container root cannot read, so that is refused (below).
+check "--userns with an image is refused (use --rootfs)" sh -c "limactl shell '$vm' $store run --userns alpine:3.22 true 2>&1 | grep -q 'not supported with an image'"
+in_vm sudo sh -c "rm -rf /var/tmp/minibox-uns && mkdir -p /var/tmp/minibox-uns && tar -xzf /mnt/minibox-dev/rootfs/$(basename "$rootfs") -C /var/tmp/minibox-uns"
+uns="sudo /mnt/minibox-dev/bin/minibox run --userns --network none --rootfs /var/tmp/minibox-uns"
+check "--userns: the container's root is uid 0 inside" sh -c "test \"\$(limactl shell '$vm' $uns -- id -u)\" = 0"
+check "--userns: it maps to an unprivileged host range" sh -c "limactl shell '$vm' $uns -- cat /proc/self/uid_map | grep -q 100000"
+in_vm sh -c "$uns -- sleep 30 >/dev/null 2>&1 &"
+check "--userns: the container process runs as that host uid" sh -c "limactl shell '$vm' sh -c 'for i in \$(seq 50); do ps -o uid= -C sleep 2>/dev/null | grep -qw 100000 && exit 0; sleep 0.1; done; exit 1'"
+limactl shell "$vm" sudo pkill -f "run --userns" >/dev/null 2>&1
+in_vm sudo rm -rf /var/tmp/minibox-uns
 check "rmi removes the image and its layers" sh -c "limactl shell '$vm' $store rmi alpine:3.22 && test -z \"\$(limactl shell '$vm' sudo ls /var/tmp/minibox-smoke-store/layers)\""
 check "an image that is not here is 125" sh -c "limactl shell '$vm' $store run alpine:3.22 true 2>/dev/null; test \$? -eq 125"
 in_vm sudo rm -rf /var/tmp/minibox-smoke-store

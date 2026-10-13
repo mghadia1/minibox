@@ -210,6 +210,7 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	netMode := fs.String("network", "bridge", "`mode`: bridge (its own address on MiniBox's bridge), none (loopback only) or host (the host's network)")
 	var ports listFlag
 	fs.Var(&ports, "p", "publish a port: `HOST:CONTAINER`[/tcp|/udp] (repeatable; bridge only)")
+	userns := fs.Bool("userns", false, "run in a user namespace, so the container's root is an unprivileged user on the host")
 	var entrypoint optionalString
 	fs.Var(&entrypoint, "entrypoint", "replace the image's entrypoint (`command`; \"\" for none)")
 	var env listFlag
@@ -231,7 +232,7 @@ func runContainer(args []string, stdin io.Reader, stdout, stderr io.Writer) int 
 	if *hostname == "" {
 		*hostname = id
 	}
-	cfg := container.Config{ID: id, Hostname: *hostname, User: *userSpec,
+	cfg := container.Config{ID: id, Hostname: *hostname, User: *userSpec, UserNS: *userns,
 		Limits: cgroup.Limits{Memory: memory.n, Swap: swap.n, CPUs: *cpus, Pids: *pids}}
 	if err := cfg.Limits.Validate(); err != nil {
 		fmt.Fprintln(stderr, "minibox:", err)

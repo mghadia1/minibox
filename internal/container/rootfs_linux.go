@@ -20,7 +20,14 @@ func setupRootfs(cfg Config) error {
 	// Mount events must not travel back to the host. systemd makes / a
 	// shared mount, and a new mount namespace starts as a copy of it, so
 	// without this the mounts below would also appear on the host.
-	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+	if cfg.UserNS {
+		// A mount namespace made together with a user namespace is "less
+		// privileged": the kernel already turns the inherited shared
+		// mounts into slaves (so nothing propagates to the host) and
+		// locks them, so their propagation can no longer be changed. Ask
+		// for slave, the state they are already in, and accept a refusal.
+		_ = unix.Mount("", "/", "", unix.MS_REC|unix.MS_SLAVE, "")
+	} else if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("making mounts private: %w", err)
 	}
 	info, err := os.Lstat(rootfs)
@@ -41,12 +48,17 @@ func setupRootfs(cfg Config) error {
 		// pivot_root needs the new root to be a mount point.
 		return fmt.Errorf("bind-mounting %s: %w", rootfs, err)
 	}
-	if err := pivotRoot(rootfs); err != nil {
+	// /proc, /dev, /sys and the masks are set up inside rootfs *before*
+	// pivot_root, as runc does: a fresh procfs or sysfs can be mounted in
+	// a user namespace only while a fully visible one is still in the
+	// tree, and pivot_root detaches the host's. The top-level mount points
+	// are checked to be plain directories, and every other path is then
+	// inside one of these new mounts, so a symlink in the image cannot
+	// redirect a mount out of the root filesystem.
+	if err := mountSpecial(cfg, rootfs); err != nil {
 		return err
 	}
-	// From here every path is the container's: a symbolic link in its root
-	// filesystem can only point at something else in it.
-	return mountSpecial()
+	return pivotRoot(rootfs)
 }
 
 // maxMountData is the most a mount's options may hold: one page.
@@ -111,11 +123,16 @@ var devices = []device{
 }
 
 // mountSpecial mounts /proc (this PID namespace's), a /dev of its own
-// with only the devices above, and /sys read-only.
-func mountSpecial() error {
+// with only the devices above, and /sys read-only, all inside root (the
+// container's root filesystem, not yet pivoted to), then masks and seals
+// the parts of /proc and /sys that leak the host or let a process reach
+// into the kernel. In a user namespace the devices are bind-mounted from
+// the host's /dev (still visible before pivot_root) instead of created
+// with mknod, which the mapped root may not do.
+func mountSpecial(cfg Config, root string) error {
 	const nosuid, nodev, noexec = unix.MS_NOSUID, unix.MS_NODEV, unix.MS_NOEXEC
 	for _, dir := range []string{"/proc", "/dev", "/sys"} {
-		if err := mountPoint(dir); err != nil {
+		if err := mountPoint(filepath.Join(root, dir)); err != nil {
 			return err
 		}
 	}
@@ -136,10 +153,14 @@ func mountSpecial() error {
 		{"cgroup2", "/sys/fs/cgroup", "cgroup2", unix.MS_RDONLY | nosuid | nodev | noexec, ""},
 	}
 	for _, m := range mounts {
-		if err := os.MkdirAll(m.target, 0o755); err != nil {
+		// The top-level /proc, /dev and /sys are checked above; /dev/pts
+		// and the rest sit inside the tmpfs and sysfs just mounted, so
+		// MkdirAll cannot be redirected by a symlink in the image.
+		target := filepath.Join(root, m.target)
+		if err := os.MkdirAll(target, 0o755); err != nil {
 			return err
 		}
-		if err := unix.Mount(m.source, m.target, m.fstype, m.flags, m.data); err != nil {
+		if err := unix.Mount(m.source, target, m.fstype, m.flags, m.data); err != nil {
 			return fmt.Errorf("mounting %s on %s: %w", m.fstype, m.target, err)
 		}
 	}
@@ -147,9 +168,15 @@ func mountSpecial() error {
 	old := unix.Umask(0)
 	defer unix.Umask(old)
 	for _, d := range devices {
-		path := filepath.Join("/dev", d.name)
-		if err := unix.Mknod(path, unix.S_IFCHR|0o666, int(unix.Mkdev(d.major, d.minor))); err != nil {
-			return fmt.Errorf("creating %s: %w", path, err)
+		target := filepath.Join(root, "/dev", d.name)
+		if cfg.UserNS {
+			if err := bindHostDevice(d.name, target); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := unix.Mknod(target, unix.S_IFCHR|0o666, int(unix.Mkdev(d.major, d.minor))); err != nil {
+			return fmt.Errorf("creating /dev/%s: %w", d.name, err)
 		}
 	}
 	links := [][2]string{
@@ -160,9 +187,93 @@ func mountSpecial() error {
 		{"pts/ptmx", "/dev/ptmx"},
 	}
 	for _, l := range links {
-		if err := os.Symlink(l[0], l[1]); err != nil {
+		if err := os.Symlink(l[0], filepath.Join(root, l[1])); err != nil {
 			return err
 		}
+	}
+	return applyProcMasks(root)
+}
+
+// bindHostDevice bind-mounts the host's /dev/<name> onto target, for a
+// user namespace where the mapped root may not mknod a real device. Run
+// before pivot_root, so the host's /dev is still at /dev.
+func bindHostDevice(name, target string) error {
+	if err := os.WriteFile(target, nil, 0o666); err != nil { // the mount point
+		return fmt.Errorf("creating /dev/%s: %w", name, err)
+	}
+	if err := unix.Mount("/dev/"+name, target, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind-mounting /dev/%s from the host: %w", name, err)
+	}
+	return nil
+}
+
+// maskedPaths are made unreadable: a file is covered with /dev/null, a
+// directory with an empty read-only tmpfs. They leak the host kernel's
+// memory, keys, timers, hardware or power use. Docker's default list.
+var maskedPaths = []string{
+	"/proc/asound", "/proc/acpi", "/proc/kcore", "/proc/keys",
+	"/proc/latency_stats", "/proc/timer_list", "/proc/timer_stats",
+	"/proc/sched_debug", "/proc/scsi", "/sys/firmware",
+	"/sys/devices/virtual/powercap",
+}
+
+// readonlyPaths can be read but not written, so a process cannot retune
+// the host kernel or trigger it. /proc/sysrq-trigger is the sharpest: a
+// write to it can crash or reboot the host. Docker's default list.
+var readonlyPaths = []string{
+	"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger",
+}
+
+// applyProcMasks hides the masked paths and seals the read-only ones,
+// inside root. A path the kernel does not have is skipped.
+func applyProcMasks(root string) error {
+	for _, p := range maskedPaths {
+		if err := maskPath(filepath.Join(root, p)); err != nil {
+			return err
+		}
+	}
+	for _, p := range readonlyPaths {
+		if err := readonlyPath(filepath.Join(root, p)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func maskPath(p string) error {
+	info, err := os.Lstat(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err := unix.Mount("tmpfs", p, "tmpfs", unix.MS_RDONLY, "mode=000,size=0"); err != nil {
+			return fmt.Errorf("masking directory %s: %w", p, err)
+		}
+		return nil
+	}
+	if err := unix.Mount("/dev/null", p, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("masking %s: %w", p, err)
+	}
+	return nil
+}
+
+func readonlyPath(p string) error {
+	if _, err := os.Lstat(p); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	// Bind the path onto itself, then remount that bind read-only: a
+	// remount can only change the mount it is given, so the bind must
+	// exist first.
+	if err := unix.Mount(p, p, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind-mounting %s read-only: %w", p, err)
+	}
+	if err := unix.Mount("", p, "", unix.MS_BIND|unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+		return fmt.Errorf("remounting %s read-only: %w", p, err)
 	}
 	return nil
 }

@@ -91,8 +91,13 @@ func TestHostname(t *testing.T) {
 	if got := strings.TrimSpace(mustSucceed(t, sh(t, rootfs, "hostname"))); got != "box" {
 		t.Fatalf("hostname inside = %q", got)
 	}
-	r := sh(t, rootfs, "hostname changed-inside")
-	mustSucceed(t, r)
+	// Init set the hostname (it had the capability); a command inside
+	// cannot change it, because CAP_SYS_ADMIN is dropped. The host's
+	// hostname is its own regardless (a separate UTS namespace).
+	out := strings.TrimSpace(mustSucceed(t, sh(t, rootfs, "hostname changed-inside 2>&1; true")))
+	if !strings.Contains(out, "not permitted") {
+		t.Errorf("a command setting the hostname: %q, want it refused (CAP_SYS_ADMIN dropped)", out)
+	}
 	if after, _ := os.Hostname(); after != before {
 		t.Fatalf("the host's hostname changed from %q to %q", before, after)
 	}
@@ -156,9 +161,17 @@ func TestRootIsTheRootfs(t *testing.T) {
 			points = append(points, f[4])
 		}
 	}
-	want := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/shm", "/dev/mqueue", "/sys", "/sys/fs/cgroup"}
-	if !slices.Equal(points, want) {
-		t.Fatalf("mount points inside = %q, want %q", points, want)
+	base := []string{"/", "/proc", "/dev", "/dev/pts", "/dev/shm", "/dev/mqueue", "/sys", "/sys/fs/cgroup"}
+	if len(points) < len(base) || !slices.Equal(points[:len(base)], base) {
+		t.Fatalf("mount points inside = %q, want them to start with %q", points, base)
+	}
+	// After the base mounts come the masked and read-only /proc and /sys
+	// paths (Milestone 5); which of them exist varies by kernel, but none
+	// may be anything else.
+	for _, p := range points[len(base):] {
+		if !strings.HasPrefix(p, "/proc/") && !strings.HasPrefix(p, "/sys/") {
+			t.Errorf("unexpected mount %q inside (not a /proc or /sys mask)", p)
+		}
 	}
 }
 
@@ -310,8 +323,9 @@ func mountsUnder(t *testing.T, dir string) []string {
 func TestMountsStayInside(t *testing.T) {
 	testutil.RequireRoot(t)
 	// The test means something only where / propagates mounts (systemd
-	// makes it shared): there, a container that forgot to make its mounts
-	// private would show them on the host.
+	// makes it shared): there, a container whose Init forgot to make its
+	// mounts private would show its /proc, /dev, /sys and masks on the
+	// host.
 	data, _ := os.ReadFile("/proc/self/mountinfo")
 	shared := false
 	for line := range strings.Lines(string(data)) {
@@ -325,7 +339,9 @@ func TestMountsStayInside(t *testing.T) {
 	rootfs := testutil.Rootfs(t)
 	done := make(chan result, 1)
 	go func() {
-		done <- sh(t, rootfs, "mount -t tmpfs none /mnt && touch /ready && while [ ! -e /go ]; do sleep 0.05; done")
+		// The command cannot mount (no CAP_SYS_ADMIN); Init's own mounts
+		// (/proc, /dev, /sys and the masks) are the test subject.
+		done <- sh(t, rootfs, "touch /ready && while [ ! -e /go ]; do sleep 0.05; done")
 	}()
 	waitFor(t, filepath.Join(rootfs, "ready"))
 	during := mountsUnder(t, rootfs)

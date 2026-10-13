@@ -83,12 +83,16 @@ func httpGet(url string) (string, error) {
 func TestBridgeNetwork(t *testing.T) {
 	testutil.RequireRoot(t)
 	rootfs := testutil.Rootfs(t)
-	out := mustSucceed(t, sh(t, rootfs, "ip -4 -o addr show eth0 | awk '{print $4}'; ip route | head -1; tail -1 /etc/hosts; grep -c '^nameserver 127' /etc/resolv.conf; ping -c 1 -W 2 10.99.0.1 >/dev/null && echo gateway-reachable"))
+	// No ping: CAP_NET_RAW is dropped (Milestone 5), so ICMP is not
+	// available. Real reachability is covered by TestContainersReachEachOther
+	// and TestTrafficOutIsMasqueraded, over TCP. Here, eth0 up with an
+	// address and a default route is what the setup promises.
+	out := mustSucceed(t, sh(t, rootfs, "ip -4 -o addr show eth0 | awk '{print $4}'; ip route | head -1; tail -1 /etc/hosts; grep -c '^nameserver 127' /etc/resolv.conf; ip -o link show eth0 | grep -q ',UP' && echo eth0-up"))
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) != 5 {
 		t.Fatalf("output %q", out)
 	}
-	addr, route, hosts, loopbackDNS, ping := lines[0], lines[1], lines[2], lines[3], lines[4]
+	addr, route, hosts, loopbackDNS, up := lines[0], lines[1], lines[2], lines[3], lines[4]
 	ip, ipnet, err := net.ParseCIDR(addr)
 	if err != nil || !ipnet.Contains(net.ParseIP("10.99.0.1")) || ip.Equal(net.ParseIP("10.99.0.1")) {
 		t.Errorf("eth0 has %q, want an address in 10.99.0.0/24 other than the bridge's", addr)
@@ -102,8 +106,8 @@ func TestBridgeNetwork(t *testing.T) {
 	if loopbackDNS != "0" {
 		t.Errorf("/etc/resolv.conf names a loopback nameserver")
 	}
-	if ping != "gateway-reachable" {
-		t.Errorf("the bridge is not reachable")
+	if up != "eth0-up" {
+		t.Errorf("eth0 is not up")
 	}
 }
 
@@ -194,7 +198,9 @@ func primaryIP(t *testing.T) string {
 func TestNoNetwork(t *testing.T) {
 	testutil.RequireRoot(t)
 	rootfs := testutil.Rootfs(t)
-	cfg := config(rootfs, "/bin/sh", "-c", "ls /sys/class/net; ip -o link | wc -l; tail -1 /etc/hosts; ping -c 1 -W 1 127.0.0.1 >/dev/null && echo loopback-up")
+	// loopback is checked by its link state, not ping: CAP_NET_RAW is
+	// dropped (Milestone 5).
+	cfg := config(rootfs, "/bin/sh", "-c", "ls /sys/class/net; ip -o link | wc -l; tail -1 /etc/hosts; ip -o link show lo | grep -q ',UP' && echo loopback-up")
 	cfg.NetworkMode = network.None
 	out := strings.Split(strings.TrimSpace(mustSucceed(t, runConfig(t, cfg, "", nil))), "\n")
 	if len(out) != 4 || out[0] != "lo" || strings.TrimSpace(out[1]) != "1" || out[2] != "127.0.1.1\tbox" || out[3] != "loopback-up" {

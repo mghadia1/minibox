@@ -53,6 +53,11 @@ type Config struct {
 	NetworkMode network.Mode   `json:"-"`
 	Ports       []network.Port `json:"-"`
 	Network     network.Inside `json:"network"`
+
+	// UserNS runs the container in its own user namespace, so its root is
+	// an unprivileged user on the host. Init needs to know (its device
+	// nodes are bind-mounted, not created with mknod).
+	UserNS bool `json:"userns,omitempty"`
 }
 
 // Exit codes for a container that could not be run, as Docker gives them:
@@ -137,6 +142,13 @@ func (c Config) Validate() error {
 	}
 	if c.NetworkMode != "" && c.NetworkMode != network.Bridge && len(c.Ports) > 0 {
 		return fmt.Errorf("ports can be published only on the bridge network, not %q", c.NetworkMode)
+	}
+	if c.UserNS && len(c.Lower) > 0 {
+		// The image's layers and the overlay are the host root's, so the
+		// container's mapped root cannot read or write them. Running an
+		// image under a user namespace needs an id-mapped mount, which is
+		// not built; a directory works.
+		return errors.New("--userns is not supported with an image yet; use --rootfs with a directory")
 	}
 	if len(c.Lower) > 0 {
 		// overlayfs reads its options as "lowerdir=a:b,upperdir=...".

@@ -24,6 +24,14 @@ import (
 // (Milestone 5).
 const cloneFlags = syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWIPC | unix.CLONE_NEWCGROUP
 
+// The host uid/gid range a --userns container's 0..65535 map onto:
+// 100000-165535, a block unlikely to be a real user, so the container's
+// root is unprivileged on the host.
+const (
+	userNSBase = 100000
+	userNSSize = 65536
+)
+
 // Forwarded are the signals passed on to the container's command: Run
 // passes them to Init, Init to the command. Not "every signal": the Go
 // runtime sends itself SIGURG to preempt goroutines, SIGCHLD is how Init
@@ -84,6 +92,9 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 	if cfg.NetworkMode != network.Host {
 		flags |= syscall.CLONE_NEWNET
 	}
+	if cfg.UserNS {
+		flags |= syscall.CLONE_NEWUSER
+	}
 	// A cgroup of its own, made first: Init is born inside it (clone3's
 	// CLONE_INTO_CGROUP), so nothing of the container runs outside its
 	// limits, even for an instant. Removed last, after anything still in
@@ -136,6 +147,21 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 		Pdeathsig:   syscall.SIGKILL,
 		UseCgroupFD: true,
 		CgroupFD:    group.FD(),
+	}
+	if cfg.UserNS {
+		// Container ids 0..65535 map to an unprivileged host range, so the
+		// container's root is host uid userNSBase, with no authority on
+		// the host. `minibox run` is real root, so it may write the maps
+		// directly (no newuidmap, no /etc/subuid).
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: userNSBase, Size: userNSSize}}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: userNSBase, Size: userNSSize}}
+		cmd.SysProcAttr.GidMappingsEnableSetgroups = true
+		// The clone leaves Init as the unmapped overflow uid, which loses
+		// the namespace's capabilities at the exec into minibox-init. Go
+		// changes to uid/gid 0 after writing the maps and before that exec,
+		// while it still holds them, so Init runs as the namespace's root
+		// (host uid userNSBase) with its capabilities intact.
+		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
 	}
 	if err := cmd.Start(); err != nil {
 		return setup(fmt.Errorf("starting the container: %w", err))
