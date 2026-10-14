@@ -7,7 +7,7 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** Milestones 0-5 of 7 built, on my machine (the GitHub
+> **Status:** Milestones 0-6 of 7 built, on my machine (the GitHub
 > repository is empty, so CI has not run). `minibox pull alpine:3.22`
 > fetches an image from its registry, checking every digest, and unpacks
 > its layers safely; `minibox run alpine:3.22 sh` runs it on an overlay of
@@ -18,10 +18,12 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 > and can publish ports (`-p 8080:80`). The command runs with a small
 > capability set, `no_new_privs`, a hand-written seccomp filter, and masked
 > and read-only `/proc` and `/sys` paths; `--userns` gives it its own user
-> namespace, so its root is an unprivileged user on the host. **It is still
-> not something to trust with hostile code:** it has no devices cgroup, one
-> shared bridge, and the user namespace does not id-map the root filesystem
-> (see Security).
+> namespace, so its root is an unprivileged user on the host. It also
+> speaks a subset of the OCI runtime lifecycle — `minibox create` /
+> `start` / `state` / `kill` / `delete` on a bundle, as runc does. **It is
+> still not something to trust with hostile code:** it has no devices
+> cgroup, one shared bridge, and the user namespace does not id-map the
+> root filesystem (see Security).
 
 > **Where it runs:** Linux only, as root. On my Mac that is a Lima VM
 > (`lima/minibox.yaml`: Ubuntu 24.04, 2 CPUs, 2 GiB, 10 GiB disk); in CI,
@@ -40,7 +42,7 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 | 3 | Limits: cgroup v2 memory, CPU and pids; OOM kills reported | Built |
 | 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Built |
 | 5 | Security: capabilities cut, `no_new_privs`, a hand-written seccomp filter, masked paths, an optional user namespace | Built |
-| 6 | The OCI runtime spec (a subset), compared with runc; start-up time measured | Not started |
+| 6 | The OCI runtime lifecycle (a subset: create/start/state/kill/delete), compared with runc; start-up time measured | Built |
 | 7 | README: diagram, decisions, failures, results; explain-it-yourself prompts | Not started |
 
 "Built" means built and tested on my machine, in the VM.
@@ -414,6 +416,83 @@ code:**
   with a clear cost and no use in an ordinary program; it is not the whole
   profile, and it has no per-argument rules.
 
+## The OCI runtime lifecycle
+
+`minibox run` is MiniBox's own one-shot command. MiniBox also speaks a
+subset of the **OCI runtime lifecycle**, the split create/start model
+that `runc` and every container engine use, on a **bundle** — a directory
+with a `config.json` (the OCI runtime spec) and a root filesystem:
+
+```bash
+cd mybundle                    # a config.json and a rootfs/, e.g. from `runc spec`
+minibox create --bundle . c1   # set it up; its process is not running yet
+minibox state c1               # -> {"status":"created", "pid":..., ...}
+minibox start c1               # run the process
+minibox state c1               # -> running, then stopped when it exits
+minibox kill c1 TERM           # signal it
+minibox delete c1              # remove a stopped container
+```
+
+- **Create sets up, start runs.** `create` starts the container's init in
+  all its namespaces and its cgroup, sets up the root filesystem and
+  network, and then **blocks**, so the container is fully "created" but
+  its command has not run. `start` releases it. The gate is an **exec
+  fifo** (as runc uses): init opens it before `pivot_root` detaches the
+  host's filesystem and blocks reading it; `start` writes one byte. Init
+  then **execs the command in its own place**, so the command is PID 1 —
+  the runc model, not `run`'s init-stays-PID-1-and-supervises model.
+- **Detached.** `minibox create` returns once setup has succeeded; the
+  container is reparented to the host's init and lives on its own, with
+  its state in `/run/minibox/oci/<id>/` (a `state.json`, the fifo, and the
+  process's `output.log`). `state` recomputes "stopped" from whether the
+  process is still alive.
+- **What it reads from config.json:** the process (args, env, cwd, user,
+  no terminal), the root path, the hostname, which namespaces to make
+  (uts/pid/mount/ipc/cgroup are always isolated; a network namespace is
+  made or the host's is shared per the config; a user namespace is
+  honored; joining an existing namespace by path is refused), and the
+  cgroup resources (memory, cpu, pids).
+- **What it does not read, on purpose** (so this is a lifecycle subset,
+  not a full OCI runtime): the config's mounts, masked/readonly paths,
+  capabilities, seccomp, rlimits, hooks and annotations. MiniBox applies
+  its own standard mounts and its own Milestone-5 hardening regardless.
+  Running an **image** under the OCI lifecycle, or `--userns` with an
+  image, is refused — the image store is the host root's, which a mapped
+  container root cannot read; use a bundle directory.
+
+### Checked against runc
+
+`scripts/oci_compare.sh` (`make oci-compare`) runs the **same bundle**
+under MiniBox and under runc and compares what the process produced and
+how the container moved through its states. runc is a reference only,
+never the engine. On 2026-10-13, Ubuntu 24.04 in the VM, runc 1.3.4: **8
+of 8 bundles matched** — `echo`, `id -u`, `hostname`, the working
+directory, `$PATH`, a written file read back, a clean exit, and stdout
+with stderr all produced identical output and the same create → running →
+stopped lifecycle. Because MiniBox ignores the config's capabilities,
+mounts and seccomp, the agreement is on lifecycle and process behaviour,
+not on those.
+
+### Start-up time
+
+`bench/oci_startup.sh` (`make oci-bench`) times `create` then `start`
+against runc on the same bundle. Quotable only with the caveat **one
+2 GiB Lima VM on one 8 GB M2 laptop; the command is `true`, so this times
+the runtime's own work, not a workload; runc applies the whole config
+(all mounts, capabilities, a libseccomp filter) while MiniBox applies its
+subset, so it is an order-of-magnitude comparison, not a controlled one.**
+Median of 30, three passes, 0 swap-ins (a clean run):
+
+| | create | start | total |
+|---|--------|-------|-------|
+| MiniBox | 9-10 ms | 5 ms | **14-15 ms** |
+| runc | 25-26 ms | 4 ms | **29-30 ms** |
+
+MiniBox's `create` is the faster of the two, which fits — it does less
+than runc (no capability or seccomp parsing from the config, fewer
+mounts). `start` is a fifo write and an `execve` in both, and is about the
+same.
+
 ## How a container starts
 
 ```
@@ -616,7 +695,18 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
   `minibox`: the default hostname is the id, usage errors are 125, Ctrl-C
   sent to `minibox run` ends the container with 130, and killing `minibox
   run` with `SIGKILL` takes the container with it.
-- **94 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
+- **The OCI lifecycle** (`internal/oci`): a bundle is created (state
+  "created", a pid), started, runs its command, reaches "stopped", and is
+  deleted; a created container is deleted before it is ever started;
+  starting a running container, killing a stopped one, and deleting a
+  running one without `--force` are each refused; `kill` ends a running
+  container; the config's working directory and cgroup memory limit are
+  applied; a command that does not exist fails at create. The spec reader
+  is unit-tested apart from the VM: the root path, hostname default, user,
+  env, network-namespace-to-mode and resource mapping, and the refusals
+  (a terminal, no args, no root, a namespace path, a too-small memory
+  limit).
+- **118 planted bugs** each fail the tests: 5 in Milestone 0 (failures not
   counted, filesystem names read from the wrong field, missing items
   inverted, cgroup v1 accepted, `check` exiting 0 on a failure), 16 in
   Milestone 1 (mounts not private, `chroot` for `pivot_root`, the old root
@@ -651,9 +741,23 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
   or `/etc/resolv.conf` not written, no network namespace, one for
   `--network host`, ports allowed off the bridge, port 0 accepted, Run
   never detaching, a port in use on the host not checked, bound UDP
-  sockets not seen, socket table ports read as decimal). Eight were caught
-  only after a fix (failures 1-3, 7 and 14).
-- **The smoke test** (`make smoke`, 46 checks): a static Linux binary,
+  sockets not seen, socket table ports read as decimal) and 11 in
+  Milestone 5 (the bounding set not dropped, `no_new_privs` not set, the
+  seccomp filter not loaded, `keyctl` left on the allowed list, each of
+  `CAP_SYS_ADMIN`, `CAP_NET_RAW` and `CAP_MKNOD` kept, the masked paths
+  not masked, the read-only paths not sealed, the user namespace not
+  entered as root, its devices not bind-mounted) and 13 in Milestone 6
+  (the exec fifo opened read-only, the working directory not set before
+  the exec, `start` writing nothing to the fifo, `start` allowed when not
+  created, `state` never recomputing stopped, `delete` not requiring
+  stopped, a zombie treated as alive, and in the spec reader: a terminal,
+  a namespace path or a too-small memory limit not refused, a network
+  namespace giving host networking, the hostname not defaulting to the id,
+  a non-root user ignored, the memory limit not mapped). Eight were caught
+  only after a fix (failures 1-3, 7 and 14); two of Milestone 6's were
+  caught only by the suite's five-minute timeout (a blocking fifo open and
+  a blocking fifo open-for-write), the rest by a specific test.
+- **The smoke test** (`make smoke`, 51 checks): a static Linux binary,
   `check` passing as root in the VM with no warnings, failing as an
   ordinary user and saying why, failing on the Mac and saying Linux is
   needed, usage errors exiting 2; real containers on a folder: their own
@@ -673,7 +777,9 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
   dropped), `no_new_privs` and seccomp are on, `/proc/kcore` is empty and
   `/proc/sysrq-trigger` is read-only, and a `--userns` container is uid 0
   inside, maps to the host's unprivileged range, and the host sees its
-  process running as that high uid.
+  process running as that high uid; and the OCI lifecycle on a bundle:
+  `create` leaves it "created", `start` runs it, it reaches "stopped" with
+  the right output, `delete` removes it, and a bad bundle fails.
 - Each container in the tests takes about a second: the race detector
   sleeps 1 s when a process exits with status 0, and every Init is a copy
   of a race-enabled test binary.
@@ -829,12 +935,35 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
     refused; the extra mounts are checked to be only `/proc` and `/sys`
     masks). The behaviour matches Docker, whose default also drops
     `CAP_SYS_ADMIN` and whose `--user` default adds no capabilities.
+18. **The OCI container never started: the fifo read saw EOF.** The exec
+    fifo opened read-only returns end-of-file from a read as soon as there
+    is no writer — and at `create` time there is none, so the init woke
+    immediately and exited "deleted before it started". A fifo opened
+    `O_RDWR` holds a write end too, so the read blocks for data instead;
+    `start`'s byte then wakes it. (The open does not block on Linux with
+    `O_RDWR`.)
+19. **The OCI command ignored its working directory.** The comparison with
+    runc showed `pwd` returning `/` where runc gave `/tmp`: the OCI path
+    `execve`s the command, and `execve` keeps the current directory,
+    unlike the `run` path's fork which sets it through `ProcAttr.Dir`. Init
+    now `chdir`s to the config's `cwd` before the exec. A test runs `pwd`
+    with a non-root `cwd` to guard it.
+20. **In the tests the OCI container never reached "stopped".** The unit
+    tests call the create logic in-process, so the container is the test
+    process's child; when it exits the test does not reap it, so it lingers
+    as a zombie, and a zombie still answers "signal 0" — the liveness
+    check read it as running forever. In production `minibox create` is
+    its own short-lived process, so the container is the host init's child
+    and is reaped. The fix makes both honest: liveness reads `/proc/<pid>/
+    stat` and treats a zombie as stopped, and `delete` reaps the process
+    if it is its own child (a harmless no-op for the real command).
 
 ## Layout
 
 | Path | What |
 |------|------|
-| `cmd/minibox/` | The command line and its exit codes; end-to-end tests of `run` |
+| `cmd/minibox/` | The command line and its exit codes; `oci.go` is the create/start/state/kill/delete commands; end-to-end tests of `run` |
+| `internal/oci/` | The OCI lifecycle: `spec.go` reads the config.json subset into a container.Config; `state.go` the on-disk state store; `runtime_linux.go` create/start/state/kill/delete; `container.CreateDetached` and the exec fifo are its engine |
 | `internal/container/config.go`, `lookpath.go` | A container's configuration and environment; finding the command in the container's PATH |
 | `internal/container/run_linux.go` | `minibox run`'s side: starting Init in new namespaces, the config and status pipes, passing signals on, exit codes |
 | `internal/container/init_linux.go` | Init, PID 1: setting up, starting the command, reaping, forwarding signals |
@@ -851,6 +980,7 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
 | `internal/container/user.go` | Users and groups from the container's own `/etc/passwd` and `/etc/group` |
 | `internal/testutil/` | Root required (or a skip), the test root filesystem, the probe (escape, memory, CPU, processes, HTTP server and client), a fake registry and layer builders |
 | `scripts/check_extraction/` | Unpacking real images by MiniBox and by GNU tar, compared |
+| `scripts/oci_compare.sh`, `bench/oci_startup.sh`, `scripts/vm-oci.sh` | The OCI lifecycle checked against runc on the same bundles, and start-up timed against it (dev-only) |
 | `internal/host/` | `minibox check`: what the machine has, checked one item at a time |
 | `lima/minibox.yaml` | The development VM |
 | `scripts/vm-test.sh` | The checks, in the VM, as root |

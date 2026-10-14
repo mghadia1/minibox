@@ -3,7 +3,7 @@
 VM ?= minibox
 DEV ?= $(HOME)/.cache/minibox-dev
 
-.PHONY: build build-linux test lint vm vm-test vm-shell vm-stop rootfs smoke clean
+.PHONY: build build-linux test lint vm vm-test vm-shell vm-stop rootfs smoke oci-compare oci-bench clean
 
 # For this machine. On a Mac the binary only says it needs Linux.
 build:
@@ -45,6 +45,14 @@ rootfs:
 
 smoke:
 	./scripts/smoke.sh
+
+# Dev-only: compare the OCI lifecycle against runc on the same bundles,
+# and time create+start against it. Needs runc in the VM (provisioned).
+oci-compare:
+	./scripts/vm-oci.sh scripts/oci_compare.sh
+
+oci-bench:
+	./scripts/vm-oci.sh scripts/oci_startup.sh
 
 clean:
 	rm -rf bin

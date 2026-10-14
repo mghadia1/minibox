@@ -58,6 +58,14 @@ type Config struct {
 	// an unprivileged user on the host. Init needs to know (its device
 	// nodes are bind-mounted, not created with mknod).
 	UserNS bool `json:"userns,omitempty"`
+
+	// ExecFifo, when set, switches Init to the OCI lifecycle: after setup
+	// it reports success ("created") and blocks reading this fifo until
+	// `start` writes to it, then it execs the command in its own place
+	// (so the command becomes PID 1, as runc does), rather than forking it
+	// and supervising. The path is on the host and is opened before
+	// pivot_root. Empty for `minibox run`.
+	ExecFifo string `json:"exec_fifo,omitempty"`
 }
 
 // Exit codes for a container that could not be run, as Docker gives them:

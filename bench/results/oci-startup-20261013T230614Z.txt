@@ -1,0 +1,17 @@
+# MiniBox OCI start-up vs runc, 3 passes, Tue Oct 13 23:06:14 UTC 2026
+# runc runc version 1.3.4-0ubuntu1~24.04.1
+--- pass 1 ---
+OCI start-up, median of 30, one 2 GiB VM on one laptop; command: true
+minibox    create   10 ms   start    5 ms   total   15 ms  (median of 30)
+runc       create   25 ms   start    4 ms   total   29 ms  (median of 30)
+swap-ins during the run: 0 (non-zero means the numbers are noise)
+--- pass 2 ---
+OCI start-up, median of 30, one 2 GiB VM on one laptop; command: true
+minibox    create    9 ms   start    5 ms   total   14 ms  (median of 30)
+runc       create   26 ms   start    4 ms   total   30 ms  (median of 30)
+swap-ins during the run: 0 (non-zero means the numbers are noise)
+--- pass 3 ---
+OCI start-up, median of 30, one 2 GiB VM on one laptop; command: true
+minibox    create    9 ms   start    5 ms   total   14 ms  (median of 30)
+runc       create   26 ms   start    4 ms   total   30 ms  (median of 30)
+swap-ins during the run: 0 (non-zero means the numbers are noise)

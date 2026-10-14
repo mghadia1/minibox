@@ -152,16 +152,12 @@ func Run(cfg Config, stdio Stdio, signals <-chan os.Signal) (res Result, err err
 		// Container ids 0..65535 map to an unprivileged host range, so the
 		// container's root is host uid userNSBase, with no authority on
 		// the host. `minibox run` is real root, so it may write the maps
-		// directly (no newuidmap, no /etc/subuid).
-		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: userNSBase, Size: userNSSize}}
-		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: userNSBase, Size: userNSSize}}
-		cmd.SysProcAttr.GidMappingsEnableSetgroups = true
-		// The clone leaves Init as the unmapped overflow uid, which loses
-		// the namespace's capabilities at the exec into minibox-init. Go
-		// changes to uid/gid 0 after writing the maps and before that exec,
-		// while it still holds them, so Init runs as the namespace's root
-		// (host uid userNSBase) with its capabilities intact.
-		cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
+		// directly (no newuidmap, no /etc/subuid). The clone leaves Init
+		// as the unmapped overflow uid, which loses the namespace's
+		// capabilities at the exec into minibox-init; the Credential
+		// changes it to uid/gid 0 after the maps are written and before
+		// that exec, while it still holds them.
+		applyUserNS(cmd.SysProcAttr)
 	}
 	if err := cmd.Start(); err != nil {
 		return setup(fmt.Errorf("starting the container: %w", err))

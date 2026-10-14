@@ -1,0 +1,10 @@
+ok   echo  ->  hello world|
+ok   id -u (root)  ->  0|
+ok   hostname  ->  runc|
+ok   cwd  ->  /tmp|
+ok   env PATH  ->  /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin|
+ok   a written file  ->  x|
+ok   exit status 0  ->  
+ok   stdout + stderr  ->  out|err|
+
+8 matched, 0 differed

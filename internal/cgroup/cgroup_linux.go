@@ -71,6 +71,14 @@ func Create(id string, l Limits) (*Group, error) {
 // FD is the group's directory, for SysProcAttr.CgroupFD.
 func (g *Group) FD() int { return g.fd }
 
+// RemoveByID removes a container's group by id, killing anything still in
+// it. For a process that did not create the group (`minibox delete`,
+// which runs after `minibox create` has exited).
+func RemoveByID(id string) error {
+	g := &Group{Path: filepath.Join(Root, Parent, id), fd: -1}
+	return g.Remove()
+}
+
 // enable turns on MiniBox's controllers for the children of dir. A cgroup
 // v2 group can use a controller only if its parent enables it for its
 // children ("subtree_control").

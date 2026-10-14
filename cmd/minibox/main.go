@@ -55,6 +55,13 @@ commands:
   rmi IMAGE  remove an image, and the layers no other image uses
   check      can this machine run containers? (exit 1 if not)
   version    print the version
+
+  OCI runtime lifecycle, on a bundle (a config.json and a root filesystem):
+  create --bundle DIR ID   set a container up, ready to start
+  start ID                 run a created container's command
+  state ID                 print a container's state as JSON
+  kill ID [SIGNAL]         signal a container's process (default TERM)
+  delete ID [--force]      remove a stopped container
 `
 
 // Exit codes for MiniBox's own commands. `minibox run` exits with the
@@ -87,6 +94,16 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		return images(args[1:], stdout, stderr)
 	case "rmi":
 		return rmi(args[1:], stdout, stderr)
+	case "create":
+		return ociCreate(args[1:], stderr)
+	case "start":
+		return ociStart(args[1:], stderr)
+	case "state":
+		return ociState(args[1:], stdout, stderr)
+	case "kill":
+		return ociKill(args[1:], stderr)
+	case "delete":
+		return ociDelete(args[1:], stderr)
 	case "check":
 		report := checkHost()
 		if err := report.Write(stdout); err != nil {

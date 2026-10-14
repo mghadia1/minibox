@@ -46,6 +46,21 @@ func Init() {
 		fail(ExitSetup, err)
 	}
 
+	// The OCI exec fifo lives on the host; open it before pivot_root
+	// detaches the host's filesystem. O_RDWR, not O_RDONLY: opening a fifo
+	// read-only when no writer is present makes a later read return EOF at
+	// once, but holding a write end too (which never blocks the open on
+	// Linux) keeps the read blocked until `start` writes. O_CLOEXEC so it
+	// does not reach the command.
+	fifoFD := -1
+	if cfg.ExecFifo != "" {
+		fd, err := unix.Open(cfg.ExecFifo, unix.O_RDWR|unix.O_CLOEXEC, 0)
+		if err != nil {
+			fail(ExitSetup, fmt.Errorf("opening the exec fifo: %w", err))
+		}
+		fifoFD = fd
+	}
+
 	if err := setupRootfs(cfg); err != nil {
 		fail(ExitSetup, fmt.Errorf("root filesystem: %w", err))
 	}
@@ -71,16 +86,52 @@ func Init() {
 		fail(ExitSetup, fmt.Errorf("working directory: %w", err))
 	}
 
-	// Ask for signals before the command exists, so that no exit and no
-	// forwarded signal is missed between starting it and waiting for it.
-	sigs := make(chan os.Signal, 64)
-	signal.Notify(sigs, append([]os.Signal{syscall.SIGCHLD}, Forwarded...)...)
-
 	pathEnv, _ := lookupEnv(env, "PATH")
 	file, err := lookPath(cfg.Args[0], pathEnv)
 	if err != nil {
 		fail(invokeCode(err), fmt.Errorf("%s: %w", cfg.Args[0], err))
 	}
+
+	if cfg.ExecFifo != "" {
+		// OCI lifecycle. Setup is done, so report "created" and wait for
+		// `start`; then become the command, so it is PID 1 as runc does.
+		_ = json.NewEncoder(statusW).Encode(status{})
+		statusW.Close()
+		statusW = nil
+		if err := waitExecFifo(fifoFD); err != nil {
+			fmt.Fprintln(os.Stderr, "minibox init:", err)
+			os.Exit(ExitSetup)
+		}
+		runtime.LockOSThread()
+		if err := harden(); err != nil {
+			fmt.Fprintln(os.Stderr, "minibox init: hardening:", err)
+			os.Exit(ExitSetup)
+		}
+		if cfg.User != "" {
+			if err := becomeUser(creds); err != nil {
+				fmt.Fprintln(os.Stderr, "minibox init:", err)
+				os.Exit(ExitSetup)
+			}
+		}
+		// execve keeps the working directory, so set it here (the fork
+		// path uses ProcAttr.Dir instead).
+		if err := unix.Chdir(cfg.Cwd); err != nil {
+			fmt.Fprintf(os.Stderr, "minibox init: working directory %s: %v\n", cfg.Cwd, err)
+			os.Exit(ExitSetup)
+		}
+		err := syscall.Exec(file, cfg.Args, env)
+		// Exec only returns on failure; the status pipe is already closed,
+		// so the error goes to the container's own stderr.
+		fmt.Fprintf(os.Stderr, "minibox init: %s: %v\n", cfg.Args[0], err)
+		os.Exit(invokeCode(err))
+	}
+
+	// `minibox run`: Init stays PID 1 and supervises the command.
+	// Ask for signals before the command exists, so that no exit and no
+	// forwarded signal is missed between starting it and waiting for it.
+	sigs := make(chan os.Signal, 64)
+	signal.Notify(sigs, append([]os.Signal{syscall.SIGCHLD}, Forwarded...)...)
+
 	attr := &syscall.ProcAttr{Dir: cfg.Cwd, Env: env, Files: []uintptr{0, 1, 2}}
 	if cfg.User != "" {
 		attr.Sys = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: creds.UID, Gid: creds.GID, Groups: creds.Groups}}
@@ -103,6 +154,46 @@ func Init() {
 	statusW = nil
 
 	os.Exit(supervise(child, sigs))
+}
+
+// waitExecFifo blocks until `start` writes the one byte to the exec fifo.
+// The fd is O_RDWR, so the read blocks for data rather than returning EOF
+// before any writer has appeared.
+func waitExecFifo(fd int) error {
+	buf := make([]byte, 1)
+	for {
+		n, err := unix.Read(fd, buf)
+		if err == unix.EINTR {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("waiting for start: %w", err)
+		}
+		if n == 0 {
+			return errors.New("the container was deleted before it started")
+		}
+		return nil
+	}
+}
+
+// becomeUser drops to a non-root user before the OCI exec, in the order
+// that keeps it allowed (groups, then gid, then uid). The run path does
+// this through the fork's Credential instead.
+func becomeUser(c Credentials) error {
+	groups := make([]int, len(c.Groups))
+	for i, g := range c.Groups {
+		groups[i] = int(g)
+	}
+	if err := unix.Setgroups(groups); err != nil {
+		return fmt.Errorf("setgroups: %w", err)
+	}
+	if err := unix.Setresgid(int(c.GID), int(c.GID), int(c.GID)); err != nil {
+		return fmt.Errorf("setgid: %w", err)
+	}
+	if err := unix.Setresuid(int(c.UID), int(c.UID), int(c.UID)); err != nil {
+		return fmt.Errorf("setuid: %w", err)
+	}
+	return nil
 }
 
 // user finds who the command runs as in the container's /etc/passwd and

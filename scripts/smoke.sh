@@ -91,5 +91,17 @@ check "rmi removes the image and its layers" sh -c "limactl shell '$vm' $store r
 check "an image that is not here is 125" sh -c "limactl shell '$vm' $store run alpine:3.22 true 2>/dev/null; test \$? -eq 125"
 in_vm sudo rm -rf /var/tmp/minibox-smoke-store
 
+# OCI runtime lifecycle (Milestone 6): create, start, state, delete on a
+# bundle. A minimal config.json (not runc's) over an unpacked Alpine.
+mb=/mnt/minibox-dev/bin/minibox
+in_vm sudo sh -c "rm -rf /var/tmp/minibox-bundle && mkdir -p /var/tmp/minibox-bundle/rootfs && tar -xzf /mnt/minibox-dev/rootfs/$(basename "$rootfs") -C /var/tmp/minibox-bundle/rootfs && printf '%s' '{\"ociVersion\":\"1.0.2\",\"process\":{\"terminal\":false,\"cwd\":\"/\",\"args\":[\"/bin/sh\",\"-c\",\"echo oci-smoke; id -u\"],\"env\":[\"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"]},\"root\":{\"path\":\"rootfs\"},\"hostname\":\"ocibox\",\"linux\":{\"namespaces\":[{\"type\":\"pid\"},{\"type\":\"mount\"},{\"type\":\"ipc\"},{\"type\":\"uts\"},{\"type\":\"cgroup\"},{\"type\":\"network\"}]}}' > /var/tmp/minibox-bundle/config.json"
+oci="sudo $mb"
+check "create leaves the container 'created'" sh -c "limactl shell '$vm' $oci create -b /var/tmp/minibox-bundle oc1 && test \"\$(limactl shell '$vm' $oci state oc1 | sed -n 's/.*\"status\": *\"\\([a-z]*\\)\".*/\\1/p')\" = created"
+check "start runs the command" in_vm $oci start oc1
+check "it reaches 'stopped' and its output is right" sh -c "limactl shell '$vm' sh -c 'for i in \$(seq 50); do test \"\$(sudo $mb state oc1 | sed -n \"s/.*\\\"status\\\": *\\\"\\([a-z]*\\)\\\".*/\\1/p\")\" = stopped && break; sleep 0.1; done; sudo cat /run/minibox/oci/oc1/output.log' | tr '\n' ' ' | grep -q 'oci-smoke 0'"
+check "delete removes it" sh -c "limactl shell '$vm' $oci delete oc1 && ! limactl shell '$vm' $oci state oc1 2>/dev/null"
+check "create without a bundle config fails" sh -c "! limactl shell '$vm' $oci create -b /var/tmp/minibox-nope ocx"
+in_vm sudo rm -rf /var/tmp/minibox-bundle
+
 echo "$passed passed, $failed failed"
 [ "$failed" -eq 0 ]

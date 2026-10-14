@@ -30,10 +30,12 @@ provision:
     #!/bin/sh
     set -eu
     export DEBIAN_FRONTEND=noninteractive
-    # gcc for `go test -race` (cgo); nftables for networking (Milestone 4).
-    command -v gcc >/dev/null && command -v nft >/dev/null || {
+    # gcc for `go test -race` (cgo); nftables for networking (Milestone 4);
+    # runc as a reference for the Milestone 6 OCI comparison (never the
+    # engine). A dev tool, like gcc — not something MiniBox builds on.
+    command -v gcc >/dev/null && command -v nft >/dev/null && command -v runc >/dev/null || {
       apt-get update -q
-      apt-get install -y -q --no-install-recommends gcc libc6-dev make nftables
+      apt-get install -y -q --no-install-recommends gcc libc6-dev make nftables runc
     }
     # Go, the version the Mac builds with, checked against go.dev's SHA-256.
     if ! /usr/local/go/bin/go version 2>/dev/null | grep -q 'go1.27.1 '; then
