@@ -7,7 +7,7 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** Milestones 0-6 of 7 built, on my machine (the GitHub
+> **Status:** All seven milestones built, on my machine (the GitHub
 > repository is empty, so CI has not run). `minibox pull alpine:3.22`
 > fetches an image from its registry, checking every digest, and unpacks
 > its layers safely; `minibox run alpine:3.22 sh` runs it on an overlay of
@@ -43,7 +43,7 @@ call wrappers) is allowed, and runc may appear in tests as a reference.
 | 4 | Networking: veth pairs on a bridge, NAT and published ports, netlink by hand | Built |
 | 5 | Security: capabilities cut, `no_new_privs`, a hand-written seccomp filter, masked paths, an optional user namespace | Built |
 | 6 | The OCI runtime lifecycle (a subset: create/start/state/kill/delete), compared with runc; start-up time measured | Built |
-| 7 | README: diagram, decisions, failures, results; explain-it-yourself prompts | Not started |
+| 7 | README: diagram, decisions, failures, results; explain-it-yourself prompts | Built |
 
 "Built" means built and tested on my machine, in the VM.
 
@@ -72,6 +72,64 @@ warnings rather than failures: nftables (without it only `--network none`
 and `host` work) and user namespaces (for Milestone 5). Exit 0 when
 everything needed is there, 1 when something is missing, 2 for a usage
 error.
+
+## Architecture
+
+Two commands put a process in a container — `minibox run` (one-shot) and
+the OCI lifecycle (`create`/`start`/…) — and they share one engine: a
+second copy of the binary (`init`) is cloned into new namespaces and a
+cgroup, sets up its own root filesystem, network and hardening, and then
+either supervises the command (`run`) or `execve`s it so it is PID 1
+(OCI). `minibox pull` and the image store feed the overlay a container
+runs on.
+
+```mermaid
+flowchart TB
+    cli["cmd/minibox: check, pull/images/rmi, run, create/start/state/kill/delete"]
+
+    subgraph pull["internal/image — minibox pull"]
+        reg["registry.go: bearer token, manifest + config + layers, every digest and size checked"]
+        extract["extract_linux.go: openat2 RESOLVE_IN_ROOT, whiteouts, no layer trusted.* xattrs"]
+        reg --> extract
+    end
+
+    images[("/var/lib/minibox: blobs, layers by diff_id, images.json")]
+    ocistate[("/run/minibox/oci/ID: state.json, exec.fifo, output.log")]
+    extract --> images
+
+    subgraph host["On the host, full privilege"]
+        run["container.Run / CreateDetached: clone /proc/self/exe init with NEWUTS NEWPID NEWNS NEWIPC NEWCGROUP, plus NEWNET and NEWUSER as asked, inside the cgroup"]
+        cg["internal/cgroup: group made before the container, born into it, usage read back, removed after"]
+        net["internal/network + internal/netlink: bridge, veth pair, a leased address, nftables NAT and published ports"]
+        run --> cg
+        run --> net
+    end
+
+    subgraph inside["As PID 1 in the new namespaces — container.Init"]
+        rootfs["rootfs_linux.go: private mounts; proc, a dev, sys and the masks mounted into the rootfs; then pivot_root"]
+        overlay["image layers mounted as an overlay inside the mount namespace (image run only)"]
+        netin["network.SetUpInside: lo, eth0, route, /etc/hosts, /etc/resolv.conf"]
+        harden["security_linux.go on a locked thread: drop capabilities and the bounding set, no_new_privs, hand-written seccomp BPF"]
+        rootfs --> overlay
+        overlay --> netin
+        netin --> harden
+    end
+
+    cli --> run
+    cli --> reg
+    images -->|"overlay source"| overlay
+    run -->|"config on fd 3, status on fd 4"| rootfs
+    harden --> runmode["minibox run: Init stays PID 1, forks the command, reaps everything, forwards signals"]
+    harden --> ocimode["OCI: report created, block on the exec fifo, then execve the command so it is PID 1"]
+    ocistate -->|"start writes one byte"| ocimode
+```
+
+The privileged setup — the clone with namespace flags, the cgroup, the
+bridge and the veth — happens on the host; everything after `pivot_root`
+happens as PID 1 inside the new namespaces, ending with the capability
+drop, `no_new_privs` and the seccomp filter just before the command runs.
+The step-by-step version, with the pipes and the signals, is under [How a
+container starts](#how-a-container-starts).
 
 ## Running a container
 
@@ -783,6 +841,77 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
 - Each container in the tests takes about a second: the race detector
   sleeps 1 s when a process exits with status 0, and every Init is a copy
   of a race-enabled test binary.
+
+## Design decisions
+
+### Scope and boundaries
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| Built from the kernel's primitives: no runc, containerd, libcontainer, go-containerregistry, CNI plugins, netlink libraries or libseccomp | Knowing what Docker and runc do underneath is the whole point of the project | `golang.org/x/sys/unix` is still used for the raw system calls; coverage is narrower than the real runtimes |
+| Linux only, root, in a disposable VM or CI runner | It changes the machine's network (a bridge, nftables rules, IP forwarding) and needs real namespaces | Nothing runs on the Mac directly; development is a Lima VM, and `check` refuses a machine that is missing a piece |
+| Not a security boundary for hostile code | Honest scope: the hardening is Docker-shaped but has gaps (no devices cgroup, one shared bridge, the rootfs is not id-mapped under `--userns`) | Said in Status and Security; the fixes (a devices cgroup, per-container filtering, an id-mapped mount, an LSM profile) are not built |
+
+### Isolation
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| A second process entered by `clone` with the namespace flags (re-exec `/proc/self/exe init`) | The Go runtime is already multi-threaded before `main`, so it cannot `unshare` itself into a new mount or PID namespace | A fresh copy of the binary per container; the config is passed on a pipe |
+| Init is PID 1 and not the command, in `minibox run` | PID 1 reaps every orphan and is immune to default signal actions, so a supervisor is needed | `run` cannot make the command PID 1; the OCI path does instead |
+| `pivot_root` with the old root detached, never `chroot` | `chroot` is escapable; the escape probe proves it | A test fails if the old root is left attached |
+| `/proc`, `/dev` and `/sys` mounted into the rootfs **before** `pivot_root` | A fresh procfs or sysfs mounts in a user namespace only while a fully visible one is still in the tree (failure 16b) | The order is load-bearing; a top-level `/proc`, `/dev` or `/sys` that is a link or a file is refused |
+
+### Images
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| Every byte checked against a digest before use: the manifest, the config, each compressed layer (and size), and each unpacked layer against the config's diff_id | A registry or a proxy must not be able to substitute content | A pull that fails leaves no layer, no folder and no image; zstd layers are refused (no zstd in the standard library) |
+| A layer unpacked while it downloads, every entry treated as hostile (`openat2(RESOLVE_IN_ROOT)`, the `*at` calls, `O_NOFOLLOW`) | A layer is a tar from elsewhere; it must not write outside its folder or follow a link in place | `a/../b` is refused though Docker allows it; checked against GNU tar on 5 real images and 300 random ones |
+| A layer's own `trusted.*` xattrs are never applied; only file capabilities and `user.*` survive | A layer could forge overlayfs whiteouts or opaque marks with `trusted.overlay.*` | Whiteouts are synthesized from `.wh.` entries instead |
+| The image overlay is mounted inside the container's mount namespace | The mount cannot outlive the container, even if `minibox run` is killed | No overlay is ever visible on the host (a test checks, during and after) |
+
+### Limits
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| cgroup v2 only; the group made before the container and the container born into it (`CLONE_INTO_CGROUP`) | No process of the container ever runs outside its limits, not even for an instant | cgroup v1 is refused by `check` |
+| No swap by default (`memory.swap.max` 0) | A memory limit that silently swaps to disk is not a limit | `--swap` opts back in |
+| Not through systemd | On a systemd machine, Docker's systemd driver is the polite owner of the tree; this is not that | MiniBox enables the controllers in its own parent group directly, which is another reason it belongs in a VM |
+
+### Networking
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| Route netlink written by hand; nftables through the `nft` command, not by hand | Netlink is the part worth building here; re-implementing nftables' expression engine was not | Said plainly: the firewall rules are shelled out to `nft` |
+| One shared bridge; addresses leased from a `flock`'d file by pid **and** start time | Simple and Docker-default-shaped; a pid alone is reused, so a dead container's address could be held forever (failure 11) | No per-container packet filtering, which is why `CAP_NET_RAW` is dropped and `ping` stops |
+| Hairpin masquerade for DNAT'd traffic that leaves through the bridge | Without it, a container cannot reach another's published port through the host's address (failure 10) | Found by reading the rules, then shown by a test |
+| Nothing about networking was measured | No throughput or latency harness was built | No performance claim is made for networking; IPv4 only |
+
+### Security
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| Docker's default capability set **minus** `CAP_NET_RAW` and `CAP_MKNOD`; none at all for a non-root `-u` command | The shared bridge has no per-container packet filter, and there is no devices cgroup to stop a new node reading the host's disks | `ping` stops working; a non-root command gets zero capabilities, matching Docker's `--user` default |
+| A hand-written classic-BPF seccomp filter (no libseccomp): kills a non-native architecture, `EPERM` for a subset of Docker's denials | Writing the BPF by hand is the point, and the jump-offset bug (failure 15) is the lesson | `keyctl` needs no capability, so only the filter can stop it — which proves the filter is load-bearing |
+| The hardening applied on a locked OS thread, just before the exec | Capabilities, `no_new_privs` and the filter are per-thread and inherited by the fork or exec from that thread | Everything privileged (mounts, hostname, network) is done first, with full capabilities |
+| `--userns` maps the container's 0-65535 to the host's 100000+; a `Credential` on the clone makes Init the namespace root before the exec | The container's root is then an unprivileged user on the host | The rootfs is not id-mapped (root-owned files read as `nobody` inside, `/etc` writes are best-effort); an image under `--userns` is refused |
+
+### The OCI lifecycle
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| `create`/`start` split on an exec fifo (runc's model); init `execve`s the command so it is PID 1 | It is how every container engine works, and matching it is the point | The fifo is opened `O_RDWR`, not `O_RDONLY`, or the read sees EOF with no writer (failure 18); the OCI path needs its own `chdir` (failure 19) |
+| A subset: the config's process, root, hostname, namespaces and resources are read; its mounts, capabilities, seccomp and masked paths are ignored | MiniBox applies its own mounts and its Milestone-5 hardening; matching capability or mount fidelity was not the goal | The runc comparison is on lifecycle and process behaviour only; an image under the lifecycle is refused |
+| Compared with runc 1.3.4 on the same bundle, runc as a reference only | An independent runtime on the same config shows whether the lifecycle and behaviour match | 8 of 8 bundles matched; runc is a development-only tool, never the engine |
+
+### Testing and measuring
+
+| Decision | Why | Cost, or what would change it |
+|----------|-----|-------------------------------|
+| The tests run in the VM and in CI as root with `MINIBOX_TEST_REQUIRE=1`, turning a skip into a failure | A suite that skips everything for lack of Linux or root must not pass | Development needs the VM; little that matters runs on the Mac |
+| 118 planted bugs, each must fail the tests | Several suites passed a planted bug at first (failures 1-3, 7, 14): the tests themselves needed testing | Each milestone adds its own plants; two of Milestone 6's are caught only by the five-minute suite timeout |
+| Checked against references: GNU tar for extraction, runc for the lifecycle and start-up | An independent implementation of the same thing surfaces a misreading that the code and its own tests would share | runc and tar are development-only; neither is a dependency |
+| Benchmarks quoted only with "one 2 GiB VM on one 8 GB laptop, not a controlled comparison", a swap check per run | The machine swaps and a laptop is not a server; drift must not be read as a result | Swapping runs are thrown away; the numbers say the mechanism works, not how it scales |
 
 ## Failures found while building it
 
