@@ -7,8 +7,10 @@ none of runc, containerd, libcontainer, go-containerregistry, CNI plugins,
 netlink libraries or libseccomp is used; `golang.org/x/sys/unix` (system
 call wrappers) is allowed, and runc may appear in tests as a reference.
 
-> **Status:** All seven milestones built, on my machine (the GitHub
-> repository is empty, so CI has not run). `minibox pull alpine:3.22`
+> **Status:** All seven milestones built, developed and tested on my
+> machine (an arm64 Lima VM) and pushed to GitHub on 2026-10-15, where CI
+> runs the whole suite as root on an amd64 Ubuntu runner — green on the
+> first run. `minibox pull alpine:3.22`
 > fetches an image from its registry, checking every digest, and unpacks
 > its layers safely; `minibox run alpine:3.22 sh` runs it on an overlay of
 > those layers, with its own hostname, process ids, mounts, IPC, cgroup and
@@ -1115,4 +1117,4 @@ does not cover (no devices cgroup, no LSM profile, no id-mapped rootfs).
 | `scripts/vm-test.sh` | The checks, in the VM, as root |
 | `scripts/rootfs.sh` | The pinned test root filesystem |
 | `scripts/smoke.sh` | The binary, checked from outside |
-| `.github/workflows/ci.yml` | CI on Ubuntu 24.04 (written; it has not run) |
+| `.github/workflows/ci.yml` | CI on an Ubuntu runner: gofmt, vet, then the whole suite as root with the race detector, and `minibox check`; green since 2026-10-15 |
